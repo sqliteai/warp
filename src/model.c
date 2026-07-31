@@ -555,39 +555,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             if (!t->data) TRUNK_FAIL;
             if (pread_all(fd, t->data, t->n * sizeof(float), off)) TRUNK_FAIL;
-        } else if (!q8_off) {                             /* Q8G -> f32 */
-            const int N = t->shape[t->ndim - 1];
-            const int64_t rows = (int64_t)(t->n / (size_t)N);
-            const int ng = (N + g - 1) / g;
-            t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
-            int8_t *qbuf = (int8_t *)malloc((size_t)rows * ng * g);
-            uint16_t *sbuf = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
-            if (!t->data || !qbuf || !sbuf ||
-                pread_all(fd, qbuf, (size_t)rows * ng * g, off) ||
-                pread_all(fd, sbuf, (size_t)rows * ng * sizeof(uint16_t), soff)) {
-                free(qbuf); free(sbuf); TRUNK_FAIL;
-            }
-            const int8_t *q = qbuf;
-            const uint16_t *sc = sbuf;
-            for (int64_t r = 0; r < rows; r++) {
-                for (int b = 0; b < ng; b++) {
-                    /* fp16 -> float without <arm_fp16.h> assumptions */
-                    const uint16_t h = sc[r * ng + b];
-                    const uint32_t sign = (uint32_t)(h >> 15) << 31;
-                    uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff, bits;
-                    if (exp == 0) { bits = sign; }
-                    else { bits = sign | ((exp + 112u) << 23) | (man << 13); }
-                    float s;
-                    memcpy(&s, &bits, 4);
-                    for (int k = 0; k < g; k++) {
-                        const int col = b * g + k;
-                        if (col >= N) break;
-                        t->data[r * N + col] = (float)q[(r * ng + b) * g + k] * s;
-                    }
-                }
-            }
-            free(qbuf); free(sbuf);
-        } else {                             /* Q8G or Q4G, kept quantized */
+        } else {                             /* Q8G, Q4G or Q3G */
             const int N = t->shape[t->ndim - 1];
             const int64_t rows = (int64_t)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
@@ -614,6 +582,39 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             if (pread_all(fd, t->q, payload, off) ||
                 pread_all(fd, t->qs, (size_t)rows * ng * sizeof(uint16_t), soff))
                 TRUNK_FAIL;
+
+            /* WASTE_Q8=0 dequantizes the trunk once here instead of at every
+             * use. It runs after the quantized load and hands the rows to
+             * waste_deq_row — the same unpacker the compute path calls — so
+             * a width this code does not itself know about cannot be
+             * mis-read at load while working everywhere else.
+             *
+             * It used to be a branch of its own, ahead of this one, with a
+             * private copy of the Q8 unpacking that read `rows * ng * g`
+             * bytes: one byte per weight. That is true of Q8G alone, but the
+             * branch caught every non-F32 format, so a Q4G trunk — what
+             * `--trunk-bits 4`, the default, produces — asked for twice the
+             * bytes it occupies and the load failed outright. Only the
+             * synthetic container, whose trunk is Q8G/F32, took the one
+             * shape it handled, which is why CI never saw it.
+             *
+             * embed_tokens stays on disk above either way: its rows go
+             * through the same unpacker when read, so the logits are
+             * identical and 1.11 GB stays out of the resident set. */
+            if (!q8_off) {
+                float *f32 = (float *)waste_dio_alloc(t->n * sizeof(float));
+                if (!f32) TRUNK_FAIL;
+                for (int64_t r = 0; r < rows; r++)
+                    waste_deq_row(t, (long)r, N, f32 + (size_t)r * (size_t)N);
+                waste_dio_free(t->q);  t->q  = NULL;
+                waste_dio_free(t->qs); t->qs = NULL;
+                /* Indistinguishable from a tensor that was F32 on disk:
+                 * unpack_row_i8 and friends branch on bits without
+                 * consulting q, and m->t is calloc'd, so a real F32 tensor
+                 * carries zeroes in all three. */
+                t->bits = 0; t->rowbytes = 0; t->group = 0;
+                t->data = f32;
+            }
         }
     }
     m->trunk_fd = fd;   /* on-disk tensors read through it */

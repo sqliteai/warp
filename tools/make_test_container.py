@@ -33,7 +33,7 @@ import zlib
 MAGIC_EXPERT = 0x50584557        # 'WEXP'
 MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
-FMT_F32, FMT_Q8G, FMT_VQ3R = 0, 2, 4
+FMT_F32, FMT_Q8G, FMT_Q4G, FMT_VQ3R = 0, 2, 3, 4
 VEC_DIM, CB_ENTRIES, STAGES, IDX_BLOCK = 8, 256, 3, 64
 GROUP = 128
 KINDS = ("gate", "up", "down")
@@ -93,7 +93,15 @@ def f16(vals):
 
 class Trunk:
     """Accumulates trunk.bin and its index, in the layout model.c reads:
-    F32 verbatim, Q8G as int8 rows followed by one fp16 scale per group."""
+    F32 verbatim, Q8G as int8 rows followed by one fp16 scale per group,
+    Q4G the same with two weights per byte.
+
+    Which format goes where follows tools/convert.py rather than being a
+    free choice: it writes Q8G for embed_tokens and lm_head and Q4G for
+    every layer weight, because --trunk-bits defaults to 4. A synthetic
+    container that is Q8G throughout does not exercise the width a real
+    one is almost entirely made of — which is how a Q4G trunk that could
+    not be dequantized at load reached a release with CI green."""
 
     def __init__(self, rng):
         self.buf = bytearray()
@@ -122,6 +130,29 @@ class Trunk:
         self.buf += f16([self.rng.uniform(0.002, 0.02)
                          for _ in range(rows * ng)])
         self.index.append({"name": name, "fmt": FMT_Q8G, "off": off,
+                           "shape": list(shape), "group": GROUP,
+                           "scale_off": soff, "bytes": len(self.buf) - off})
+
+    def q4g(self, name, shape):
+        """Two weights per byte, zero point 8, one fp16 scale per group —
+        the layout model.c unpacks as
+            (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8
+        so the low nibble is the even element and the high nibble the odd
+        one. Stored values are v + 8, i.e. 0..15 for v in -8..7."""
+        rows, N = 1, shape[-1]
+        for s in shape[:-1]:
+            rows *= s
+        ng = (N + GROUP - 1) // GROUP
+        off = len(self.buf)
+        # Padded out to whole groups, as the converter does. GROUP is even,
+        # so the pairing below never runs off the end.
+        vals = [self.rng.randrange(0, 16) for _ in range(rows * ng * GROUP)]
+        self.buf += bytes(vals[i] | (vals[i + 1] << 4)
+                          for i in range(0, len(vals), 2))
+        soff = len(self.buf)
+        self.buf += f16([self.rng.uniform(0.002, 0.02)
+                         for _ in range(rows * ng)])
+        self.index.append({"name": name, "fmt": FMT_Q4G, "off": off,
                            "shape": list(shape), "group": GROUP,
                            "scale_off": soff, "bytes": len(self.buf) - off})
 
@@ -264,13 +295,13 @@ def main():
         if L in kda:
             a = p + "self_attn."
             for w in ("q_proj", "k_proj", "v_proj"):
-                t.q8g(a + w + ".weight", [C_KDA, hid])
-            t.q8g(a + "b_proj.weight", [H_KDA, hid])
-            t.q8g(a + "f_a_proj.weight", [D_KDA, hid])
-            t.q8g(a + "f_b_proj.weight", [C_KDA, D_KDA])
-            t.q8g(a + "g_a_proj.weight", [D_KDA, hid])
-            t.q8g(a + "g_b_proj.weight", [C_KDA, D_KDA])
-            t.q8g(a + "o_proj.weight", [hid, C_KDA])
+                t.q4g(a + w + ".weight", [C_KDA, hid])
+            t.q4g(a + "b_proj.weight", [H_KDA, hid])
+            t.q4g(a + "f_a_proj.weight", [D_KDA, hid])
+            t.q4g(a + "f_b_proj.weight", [C_KDA, D_KDA])
+            t.q4g(a + "g_a_proj.weight", [D_KDA, hid])
+            t.q4g(a + "g_b_proj.weight", [C_KDA, D_KDA])
+            t.q4g(a + "o_proj.weight", [hid, C_KDA])
             for w in ("q_conv1d", "k_conv1d", "v_conv1d"):
                 t.f32(a + w + ".weight", [C_KDA, 1, 4])
             t.f32(a + "A_log", [1, 1, H_KDA, 1])
@@ -278,23 +309,23 @@ def main():
             t.f32(a + "o_norm.weight", [D_KDA])
         else:
             a = p + "self_attn."
-            t.q8g(a + "q_proj.weight", [nh * qd, hid])
-            t.q8g(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hid])
+            t.q4g(a + "q_proj.weight", [nh * qd, hid])
+            t.q4g(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hid])
             t.f32(a + "kv_a_layernorm.weight", [kvl])
-            t.q8g(a + "kv_b_proj.weight", [nh * (cfg["qk_nope_head_dim"] + vh), kvl])
-            t.q8g(a + "o_proj.weight", [hid, nh * vh])
+            t.q4g(a + "kv_b_proj.weight", [nh * (cfg["qk_nope_head_dim"] + vh), kvl])
+            t.q4g(a + "o_proj.weight", [hid, nh * vh])
         if L < cfg["first_k_dense_replace"]:
-            t.q8g(p + "mlp.gate_proj.weight", [dense, hid])
-            t.q8g(p + "mlp.up_proj.weight", [dense, hid])
-            t.q8g(p + "mlp.down_proj.weight", [hid, dense])
+            t.q4g(p + "mlp.gate_proj.weight", [dense, hid])
+            t.q4g(p + "mlp.up_proj.weight", [dense, hid])
+            t.q4g(p + "mlp.down_proj.weight", [hid, dense])
         else:
             m = p + "block_sparse_moe."
-            t.q8g(m + "gate.weight", [cfg["num_experts"], hid])
+            t.q4g(m + "gate.weight", [cfg["num_experts"], hid])
             t.f32(m + "gate.e_score_correction_bias", [cfg["num_experts"]])
             sh = moe * cfg["num_shared_experts"]
-            t.q8g(m + "shared_experts.gate_proj.weight", [sh, hid])
-            t.q8g(m + "shared_experts.up_proj.weight", [sh, hid])
-            t.q8g(m + "shared_experts.down_proj.weight", [hid, sh])
+            t.q4g(m + "shared_experts.gate_proj.weight", [sh, hid])
+            t.q4g(m + "shared_experts.up_proj.weight", [sh, hid])
+            t.q4g(m + "shared_experts.down_proj.weight", [hid, sh])
     t.f32("model.norm.weight", [hid])
     t.q8g("lm_head.weight", [cfg["vocab_size"], hid])
     with open(os.path.join(args.out, "trunk.bin"), "wb") as f:
