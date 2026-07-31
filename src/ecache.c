@@ -100,8 +100,29 @@ static void  ec_volatile(waste_ecache *c, int si) { (void)c; (void)si; }
 #ifndef _WIN32
 #include <sys/mman.h>
 static int ec_wire(void *p, size_t n) { return mlock(p, n) == 0; }
+static void ec_wire_quota(uint64_t total) { (void)total; }
 #else
 static int ec_wire(void *p, size_t n) { return VirtualLock(p, n) != 0; }
+/* VirtualLock is bounded by the process working-set quota, whose default
+ * maximum is about 1.4 MB — three slots of Kimi-Linear, a fraction of one
+ * K3 record. Without raising it first, wiring a multi-GB cache fails for
+ * every slot and WASTE_MLOCK silently degrades to a pageable cache (the
+ * counterpart of the macOS vm.user_wire_limit note above, which Windows
+ * enforces per-process instead of per-machine). Raise min and max to the
+ * cache plus slack for the trunk and stacks; the *_DISABLE flags make
+ * both soft limits, so this cannot deadlock the machine — under real
+ * pressure the kernel may still trim, and the wiring loop's per-slot
+ * failure count remains the report of record. Needs no privilege beyond
+ * what an interactive session already has; a refusal falls through to the
+ * existing "those stay pageable" path. */
+static void ec_wire_quota(uint64_t total)
+{
+    const uint64_t slack = 512ull << 20;
+    SetProcessWorkingSetSizeEx(GetCurrentProcess(),
+                               (SIZE_T)(total + slack), (SIZE_T)(total + slack),
+                               QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+                                   QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+}
 #endif
 
 static void ec_release_last(waste_ecache *c)
@@ -279,6 +300,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 
     c->slot_bytes = (rec_bytes + WASTE_DIO_ALIGN - 1) / WASTE_DIO_ALIGN *
                     WASTE_DIO_ALIGN;
+    if (c->wired) ec_wire_quota((uint64_t)c->n_slots * c->slot_bytes);
     for (int i = 0; i < c->n_slots; i++) {
         c->slot[i].key = -1;
         c->slot[i].state = EC_EMPTY;
