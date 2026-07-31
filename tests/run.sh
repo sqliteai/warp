@@ -456,13 +456,26 @@ PY
     if [ "$SYNTHETIC" = 1 ]; then
         sk "learned hotlist" "synthetic container carries no tokenizer"
     else
+    # Empty, not 0, when the count cannot be read: a run that printed no
+    # stat line and a run that missed nothing are different outcomes, and
+    # `|| echo 0` used to collapse them. On a machine whose budget holds the
+    # whole working set the warm run reaches 0 misses — the best result this
+    # check can produce — and the old `warm -gt 0` guard reported it as
+    # "hotlist did not reduce misses (584 -> 0)".
+    misses() { grep -oE "[0-9]+ miss" | grep -oE "[0-9]+"; }
     rm -f "$MODEL/usage.waste"
     cold=$(./waste run "$MODEL" "The capital of France is" -n 12 --budget 5G --learn 2>&1 \
-           | grep -oE "[0-9]+ miss" | grep -oE "[0-9]+" || echo 0)
+           | misses)
     warm=$(./waste run "$MODEL" "The capital of France is" -n 12 --budget 5G 2>&1 \
-           | grep -oE "[0-9]+ miss" | grep -oE "[0-9]+" || echo 0)
+           | misses)
     rm -f "$MODEL/usage.waste"
-    if [ "${warm:-0}" -gt 0 ] && [ "${warm:-0}" -lt "${cold:-0}" ]; then
+    if [ -z "$cold" ] || [ -z "$warm" ]; then
+        no "hotlist: no miss count in the output of waste run"
+    elif [ "$cold" -eq 0 ]; then
+        # Nothing to warm, so nothing is demonstrated either way. Saying
+        # PASS here would be passing by luck.
+        sk "learned hotlist" "the cold run already missed nothing"
+    elif [ "$warm" -lt "$cold" ]; then
         ok "learned hotlist warms the cache ($cold -> $warm misses)"
     else
         no "hotlist did not reduce misses ($cold -> $warm)"
