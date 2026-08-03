@@ -129,7 +129,7 @@ simulation above it. The 1.5 tok/s projection for K3 on 64 GB stands.
 > floor below is the single most predictive number in the project — but
 > the projection assumed a cache several times larger than a 64 GB
 > machine can actually give K3 once the 27.28 GB trunk is resident, and
-> it costed only the I/O. Measured sweep in [LEARNED.md](LEARNED.md) §12.
+> it cost only the I/O. Measured sweep in [LEARNED.md](LEARNED.md) §12.
 
 **The one place it is worse is the most useful finding.** At 3% the
 measured hit rate is 13.2% against a simulated 29.4%, and at 1.5% it is
