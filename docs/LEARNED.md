@@ -599,7 +599,7 @@ first time GitHub ran the workflow rather than by anyone reading the code.
 **`test_image` never linked on Linux.** Its rule passed `$(LDFLAGS)` —
 empty — where every other rule passes `$(LDLIBS)`, so the binary linked
 without `-lm`. It worked on macOS for a week because clang folds the one
-`sqrt()` in `image.c:71` into an instruction and glibc/gcc does not, so
+`sqrt()` in `image.c:71` into an instruction and glibc/gcc do not, so
 the undefined reference existed only on the platform nobody built on. The
 earlier Linux runs in [BACKENDS.md](BACKENDS.md) missed it because they
 predate the image loader. Every link rule now passes `$(LDLIBS)`,
