@@ -309,7 +309,7 @@ env var — because the question recurs for every new container.
 ### D. Batching and speculative decoding — refuted for this machine
 
 The offloading literature — SpecMoEOff (2.5x), SP-MoE, MoE-SpeQ — all
-assumes **compute is free and the transfer is the wall**. On a GPU behind
+assume **compute is free and the transfer is the wall**. On a GPU behind
 PCIe that holds. Here it does not: at the margin compute is 1.5 s/token
 against 1.62 s of I/O. They are nearly equal.
 
