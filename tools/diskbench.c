@@ -28,11 +28,24 @@ static double now(void) {
     return t.tv_sec + t.tv_usec / 1e6;
 }
 
+/* Linux has no F_NOCACHE; the page cache is bypassed with O_DIRECT at open
+ * time instead, which is what the engine itself does (see model.c). Without it
+ * this benchmark reports page-cache throughput on Linux — e.g. 42 GB/s
+ * sequential on a drive whose link tops out at 3.9 GB/s. Buffers here are
+ * already posix_memalign'd to 4096 and the record size is a 4096 multiple, so
+ * O_DIRECT's alignment requirements are met. */
+#if defined(__linux__) && defined(O_DIRECT)
+#define DIO_FLAG O_DIRECT
+#else
+#define DIO_FLAG 0
+#endif
+
 static void nocache(int fd) {
 #ifdef __APPLE__
     fcntl(fd, F_NOCACHE, 1);
     fcntl(fd, F_RDAHEAD, 0);
 #endif
+    (void)fd;
 }
 
 static const char *g_path;
@@ -43,7 +56,7 @@ typedef struct { int id, nthreads; double bytes; } targ;
 
 static void *rand_reader(void *p) {
     targ *a = (targ *)p;
-    int fd = open(g_path, O_RDONLY);
+    int fd = open(g_path, O_RDONLY | DIO_FLAG);
     if (fd < 0) { perror("open"); return NULL; }
     nocache(fd);
     void *buf = NULL;
@@ -75,7 +88,7 @@ int main(int argc, char **argv) {
     printf("file %.1f GB, record %.1f MB, path %s\n", file_gb, rec_mb, g_path);
 
     /* 1. sequential write */
-    int fd = open(g_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(g_path, O_WRONLY | O_CREAT | O_TRUNC | DIO_FLAG, 0644);
     if (fd < 0) { perror("open write"); return 1; }
     nocache(fd);
     void *buf;
@@ -92,7 +105,7 @@ int main(int argc, char **argv) {
     printf("seq write   : %6.2f GB/s\n", written / dt / (1u << 30));
 
     /* 2. sequential read, cache-bypassed */
-    fd = open(g_path, O_RDONLY); nocache(fd);
+    fd = open(g_path, O_RDONLY | DIO_FLAG); nocache(fd);
     t0 = now(); size_t rd = 0; ssize_t r;
     while ((r = read(fd, buf, g_rec)) > 0) rd += r;
     dt = now() - t0; close(fd);
