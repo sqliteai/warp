@@ -280,7 +280,16 @@ test_cpus$(EXE): tests/test_cpus.o
 -include $(OBJ:.o=.d) $(SHOBJ:.o=.d) cli/main.d \
         $(patsubst %.c,%.d,$(wildcard tests/*.c))
 
+# The expert-merge worker (tools/merge_experts.py drives it). Not in `all`:
+# it converts models rather than running them, so it belongs next to the
+# converter, and nothing the engine ships depends on it. It links libwaste.a
+# for waste_vq_encode and waste_crc32 specifically so a merged record is
+# encoded and checksummed by the same code the engine and convert.py use.
+merge_layer$(EXE): tools/merge_layer.c libwaste.a
+	$(CC) $(CFLAGS) -o $@ $< libwaste.a -lm -lpthread $(STATIC)
+
 clean:
+	rm -f merge_layer merge_layer.exe
 	rm -f $(OBJ) $(SHOBJ) cli/*.o tests/*.o $(OBJ:.o=.d) $(SHOBJ:.o=.d) \
 	      cli/*.d tests/*.d libwaste.a waste waste.exe \
 	      $(TESTBINS) $(TESTNAMES) $(addsuffix .exe,$(TESTNAMES)) \

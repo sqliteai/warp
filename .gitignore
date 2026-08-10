@@ -9,6 +9,7 @@ model.waste/
 *.o.tmp
 /test_*
 waste
+merge_layer
 libwaste.a
 *.a
 

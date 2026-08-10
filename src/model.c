@@ -769,7 +769,13 @@ static int validate_text_tensors(waste_model *m)
         if (c->n_experts && L >= c->first_dense) {
             const int lat = c->latent_dim ? c->latent_dim : hid;
             const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
-            REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
+            /* A merged container (n_experts == 1) has no router — moe_layer
+             * takes the no-choice path and never reads this. Its trunk still
+             * carries the original [E, hidden] tensor, because the trunk is
+             * copied byte for byte rather than rebuilt, so requiring the
+             * shape here would reject a container the engine can run. */
+            if (!c->no_router)
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L), hid, shared);
@@ -869,6 +875,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->eps = (float)js_num(d, js_get(d, cfg, "rms_norm_eps"), 1e-5);
     c->routed_scale = (float)js_num(d, js_get(d, cfg, "routed_scaling_factor"), 1.0);
     c->renorm = js_get(d, cfg, "moe_renormalize") >= 0;
+    c->no_router = js_get(d, cfg, "moe_no_router") >= 0;
 
     c->latent_dim = (int)js_int(d, js_get(d, cfg, "routed_expert_hidden_size"), 0);
     c->latent_norm = js_get(d, cfg, "latent_moe_use_norm") >= 0;
@@ -2521,7 +2528,10 @@ static int predict_next_moe(waste_model *m, int L, const float *in, int *out, in
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, hid = c->hidden;
-    if (n <= 0 || E <= 0 || L + 1 >= c->n_layers) return 0;
+    /* A no-router container runs every expert on every token, so there is
+     * nothing to predict, and the gate.weight its trunk still carries is the
+     * unmerged [896, hidden] one. Nothing to ask. */
+    if (n <= 0 || E <= 0 || c->no_router || L + 1 >= c->n_layers) return 0;
     const waste_tensor *g = waste_find(m, tname(
         "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L + 1));
     if (!g) return 0;
@@ -2557,14 +2567,29 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     /* K3's Stable LatentMoE: experts run on a narrower projection of the
      * hidden state. `in` still drives the router and the shared experts. */
     const int lat = c->latent_dim ? c->latent_dim : hid;
+    int idx[64];
+    float w[64];
+    if (c->no_router) {
+        /* A merged container (tools/merge_experts.py): the bank holds
+         * clusters of the original experts, every one of them runs on every
+         * token, and each cluster's share of the routed weight is already
+         * folded into its own down projection. So the weight here is a
+         * constant, and the [896, hidden] router the trunk still carries has
+         * no row per expert left to score.
+         *
+         * The branch is not only a saving — at K == 1 it is required to be
+         * correct. The renormalize step below is guarded by `K > 1`, so a
+         * single expert would keep the raw sigmoid of its router score, a
+         * per-token number in (0, 1), where the layer it replaces always
+         * summed to exactly one before `routed_scale`. */
+        for (int j = 0; j < K; j++) { idx[j] = j; w[j] = c->routed_scale; }
+    } else {
     float *sc = m->att + WASTE_ATT_ROUTER_OFF;
     matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)), in, E, hid);
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias", c->prefix, L);
     float *score = sc + E;
     for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
 
-    int idx[64];
-    float w[64];
     for (int j = 0; j < K; j++) {
         int best = -1;
         float bv = -1e30f;
@@ -2584,6 +2609,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         for (int j = 0; j < K; j++) w[j] /= (s + 1e-20f);
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
+    }
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
 
     /* WASTE_DUMP_ROUTE=path appends one line per (token, layer):
@@ -3361,11 +3387,15 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
                           c->prefix, L);
     for (int t = 0; t < nT; t++) {
+        int *idx = route + (size_t)t * K;
+        float *w = rw + (size_t)t * K;
+        if (c->no_router) {    /* merged container — see moe_layer */
+            for (int j = 0; j < K; j++) { idx[j] = j; w[j] = c->routed_scale; }
+            goto routed_done;
+        }
         matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight",
                                             c->prefix, L)), in + (size_t)t * hid, E, hid);
         for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
-        int *idx = route + (size_t)t * K;
-        float *w = rw + (size_t)t * K;
         for (int j = 0; j < K; j++) {
             int best = -1; float bv = -1e30f;
             for (int e = 0; e < E; e++) {
@@ -3383,6 +3413,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
             for (int j = 0; j < K; j++) w[j] /= (s + 1e-20f);
         }
         for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
+routed_done:
         /* Same trace as moe_layer's, from the path that routes a whole
          * chunk at once — a prefill produces in one pass what decode would
          * take hundreds of seconds to emit. */

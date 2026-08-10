@@ -61,6 +61,14 @@ typedef struct {
     int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
     float eps, routed_scale;
     int renorm;
+    /* moe_no_router: every expert in the bank runs on every token, with no
+     * selection and no per-token weight. Written by tools/merge_experts.py,
+     * whose merged experts are clusters of the original ones and whose
+     * router — [896, hidden] in the trunk — no longer has a row per expert
+     * to score. A container that sets it has folded each cluster's share of
+     * the routed weight into its own down projection, so the engine's job
+     * is to run all of them and sum. Never set by tools/convert.py. */
+    int no_router;
 
     /* --- K3 additions (all absent/0 for Kimi-Linear) ------------------- */
     int   latent_dim;                /* routed_expert_hidden_size; 0 = none */
