@@ -122,6 +122,7 @@ uint32_t waste_cpu_features(void)
             if (ymm_ok && (r[1] & (1u << 5)))  f |= WASTE_CPU_AVX2;
             if (zmm_ok && (r[1] & (1u << 16))) f |= WASTE_CPU_AVX512F;
             if (zmm_ok && (r[1] & (1u << 30))) f |= WASTE_CPU_AVX512BW;
+            if (zmm_ok && (r[2] & (1u << 1)))  f |= WASTE_CPU_AVX512VBMI;
             run_cpuid(7, 1, r);
             if (ymm_ok && (r[0] & (1u << 4)))  f |= WASTE_CPU_AVX_VNNI;
         }

@@ -56,6 +56,7 @@ typedef enum {
     WASTE_CPU_AVX512F  = 1u << 11,
     WASTE_CPU_AVX512BW = 1u << 12,
     WASTE_CPU_AVX_VNNI = 1u << 13,
+    WASTE_CPU_AVX512VBMI = 1u << 14,
     WASTE_CPU_RVV      = 1u << 20,
 } waste_cpu_feature;
 
@@ -75,11 +76,12 @@ typedef struct {
     void (*rmsnorm_gated)(int C, const float *x, const float *gate,
                           const float *weight, float eps, float *y);
 
-    /* The two range kernels that carry the arithmetic (see simd.h). They
+    /* The range kernels that carry the arithmetic (see simd.h). They
      * take (begin, end, arg) because that is what the thread pool hands
      * out, so dispatch costs one indirect call per range, not per row. */
     void (*mvq_rows_f32)(int b, int e, void *arg);
     void (*lutb_range)(int lo, int hi, void *arg);
+    void (*vq_rows_p6)(int b, int e, void *arg);
 
     /* Set by a backend that wants the whole row range in one call — a GPU
      * dispatch must not be split across pool threads. Call sites use

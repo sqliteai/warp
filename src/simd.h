@@ -43,6 +43,27 @@ typedef struct {
     int cb_base, stages, entries, vec_dim;
 } lutb_arg;
 
+typedef struct {
+    float *y; const uint8_t *idx; const uint16_t *scale;
+    const int8_t *lut8; const float *lscale;
+    int nv;
+} vqp_arg;
+
+#ifndef VQ_TILE
+#define VQ_TILE 64
+#endif
+
+#ifndef WASTE_VQ_LUT_BLK
+#define WASTE_VQ_LUT_BLK 32
+#endif
+
+/* Unpack of the converter's little-endian 4x6 packing. Kept as one macro so
+ * the scalar path, NEON, and AVX-512 paths cannot drift apart. */
+#define P6_J0(b0, b1, b2) ((b0) & 0x3f)
+#define P6_J1(b0, b1, b2) ((((b0) >> 6) | ((b1) << 2)) & 0x3f)
+#define P6_J2(b0, b1, b2) ((((b1) >> 4) | ((b2) << 4)) & 0x3f)
+#define P6_J3(b0, b1, b2) (((b2) >> 2) & 0x3f)
+
 /* fp16 scale -> float, and one signed 3-bit code out of a packed row. Both
  * are needed by every implementation, and both are small enough that a
  * shared inline beats a call. */

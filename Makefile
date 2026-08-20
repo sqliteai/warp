@@ -186,7 +186,7 @@ src/metal.o: src/metal.m
 # so helpful as warning that the flag went missing. Invisible on ARM,
 # where these translation units are not in SRC at all.
 src/simd_avx2.o:   override CFLAGS += -mavx2 -mfma
-src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw
+src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw -mavx512vbmi
 
 all: waste$(EXE) libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
 
@@ -216,7 +216,7 @@ src/metal.pic.o: src/metal.m
 	$(CC) $(CFLAGS) $(PICFLAG) -fobjc-arc -c -o $@ $<
 
 src/simd_avx2.pic.o:   override CFLAGS += -mavx2 -mfma
-src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw
+src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw -mavx512vbmi
 
 libwaste.$(SOEXT): $(SHOBJ)
 	$(CC) $(CFLAGS) -shared -o $@ $^ $(SHLDFLAGS) $(LDLIBS)

@@ -2120,20 +2120,7 @@ static void vq_quant_lut(const float *lut, int nv, int st, int en,
     vq_quant_range(0, (nv + WASTE_VQ_LUT_BLK - 1) / WASTE_VQ_LUT_BLK, &a);
 }
 
-typedef struct {
-    float *y; const uint8_t *idx; const uint16_t *scale;
-    const int8_t *lut8; const float *lscale;
-    int nv;
-} vqp_arg;
-
-/* Unpack of the converter's little-endian 4x6 packing. Kept as one macro so
- * the scalar path and the NEON path cannot drift apart. */
-#define P6_J0(b0, b1, b2) ((b0) & 0x3f)
-#define P6_J1(b0, b1, b2) ((((b0) >> 6) | ((b1) << 2)) & 0x3f)
-#define P6_J2(b0, b1, b2) ((((b1) >> 4) | ((b2) << 4)) & 0x3f)
-#define P6_J3(b0, b1, b2) (((b2) >> 2) & 0x3f)
-
-static void vq_rows_p6(int b, int e, void *p)
+void waste_vq_rows_p6(int b, int e, void *p)
 {
     vqp_arg *a = (vqp_arg *)p;
     const int nv = a->nv;
@@ -2151,73 +2138,18 @@ static void vq_rows_p6(int b, int e, void *p)
             int16_t sum[VQ_TILE];
             memset(sum, 0, sizeof sum);
 
-/* -DWASTE_P6_SCALAR drops to the portable path. The two are meant to agree
- * exactly — the accumulation is integer until the per-block fold, so there
- * is no reordering for float addition to notice — and that is only worth
- * claiming if it can be checked. */
-#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(WASTE_P6_SCALAR)
-            if (nr == VQ_TILE) {
-                int16x8_t s[8];
-                for (int i = 0; i < 8; i++) s[i] = vdupq_n_s16(0);
-                for (int v = v0; v < v1; v++) {
-                    const int8_t *T = a->lut8 + (size_t)v * 4 * en;
-                    int8x16x4_t T0, T1, T2, T3;
-                    for (int k = 0; k < 4; k++) {
-                        T0.val[k] = vld1q_s8(T +   0 + k * 16);
-                        T1.val[k] = vld1q_s8(T +  64 + k * 16);
-                        T2.val[k] = vld1q_s8(T + 128 + k * 16);
-                        T3.val[k] = vld1q_s8(T + 192 + k * 16);
-                    }
-                    const uint8_t *ix = a->idx +
-                        ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * 3;
-                    for (int g = 0; g < 4; g++) {
-                        const uint8x16x3_t I = vld3q_u8(ix + g * 48);
-                        const uint8x16_t j0 =
-                            vandq_u8(I.val[0], vdupq_n_u8(0x3f));
-                        const uint8x16_t j1 = vandq_u8(
-                            vorrq_u8(vshrq_n_u8(I.val[0], 6),
-                                     vshlq_n_u8(I.val[1], 2)), vdupq_n_u8(0x3f));
-                        const uint8x16_t j2 = vandq_u8(
-                            vorrq_u8(vshrq_n_u8(I.val[1], 4),
-                                     vshlq_n_u8(I.val[2], 4)), vdupq_n_u8(0x3f));
-                        const uint8x16_t j3 = vshrq_n_u8(I.val[2], 2);
-                        /* Each lookup is widened on its own rather than
-                         * summed in int8 first: two int8 tables can add to
-                         * 254 and the table is worth a bit more than the
-                         * two instructions that would save. */
-                        const int8x16_t r0v = vqtbl4q_s8(T0, j0);
-                        const int8x16_t r1v = vqtbl4q_s8(T1, j1);
-                        const int8x16_t r2v = vqtbl4q_s8(T2, j2);
-                        const int8x16_t r3v = vqtbl4q_s8(T3, j3);
-                        int16x8_t lo = s[g * 2], hi = s[g * 2 + 1];
-                        lo = vaddw_s8(lo, vget_low_s8(r0v));
-                        hi = vaddw_s8(hi, vget_high_s8(r0v));
-                        lo = vaddw_s8(lo, vget_low_s8(r1v));
-                        hi = vaddw_s8(hi, vget_high_s8(r1v));
-                        lo = vaddw_s8(lo, vget_low_s8(r2v));
-                        hi = vaddw_s8(hi, vget_high_s8(r2v));
-                        lo = vaddw_s8(lo, vget_low_s8(r3v));
-                        hi = vaddw_s8(hi, vget_high_s8(r3v));
-                        s[g * 2] = lo; s[g * 2 + 1] = hi;
-                    }
-                }
-                for (int i = 0; i < 8; i++) vst1q_s16(sum + i * 8, s[i]);
-            } else
-#endif
-            {
-                for (int v = v0; v < v1; v++) {
-                    const int8_t *T = a->lut8 + (size_t)v * 4 * en;
-                    const uint8_t *ix = a->idx +
-                        ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * 3;
-                    for (int r = 0; r < nr; r++) {
-                        const unsigned b0 = ix[r * 3], b1 = ix[r * 3 + 1],
-                                       b2 = ix[r * 3 + 2];
-                        sum[r] = (int16_t)(sum[r] +
-                            T[P6_J0(b0, b1, b2)] +
-                            T[en + P6_J1(b0, b1, b2)] +
-                            T[2 * en + P6_J2(b0, b1, b2)] +
-                            T[3 * en + P6_J3(b0, b1, b2)]);
-                    }
+            for (int v = v0; v < v1; v++) {
+                const int8_t *T = a->lut8 + (size_t)v * 4 * en;
+                const uint8_t *ix = a->idx +
+                    ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * 3;
+                for (int r = 0; r < nr; r++) {
+                    const unsigned b0 = ix[r * 3], b1 = ix[r * 3 + 1],
+                                   b2 = ix[r * 3 + 2];
+                    sum[r] = (int16_t)(sum[r] +
+                        T[P6_J0(b0, b1, b2)] +
+                        T[en + P6_J1(b0, b1, b2)] +
+                        T[2 * en + P6_J2(b0, b1, b2)] +
+                        T[3 * en + P6_J3(b0, b1, b2)]);
                 }
             }
             const float ls = a->lscale[v0 / WASTE_VQ_LUT_BLK];
@@ -2242,7 +2174,7 @@ static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
     const int nv = N / m->vec_dim;
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
-        vq_rows_p6(0, M, &a);
+        waste_k.vq_rows_p6(0, M, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         vq_rows(0, M, &a);
@@ -2269,7 +2201,7 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
     const int nv = N / m->vec_dim;
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
-        waste_parallel_for(M, VQ_TILE * p6_chunk, vq_rows_p6, &a);
+        waste_parallel_for(M, VQ_TILE * p6_chunk, waste_k.vq_rows_p6, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         /* min_chunk = VQ_TILE keeps every thread's range block-aligned,
