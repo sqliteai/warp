@@ -247,7 +247,20 @@ static void *rand_reader(void *p) {
     double got = 0;
     for (int i = 0; i < g_reps; i++) {
         seed = seed * 1103515245u + 12345u;
-        off_t off = (off_t)(seed % nrec) * g_rec;
+        /* Not off_t: under LLP64 — MSYS2 UCRT64, the documented Windows
+         * build — off_t is a 32-bit long, while g_file and g_rec are size_t
+         * and waste_pread takes an int64_t precisely so that an offset past
+         * 2 GiB survives the trip to ReadFile's Offset/OffsetHigh pair.
+         * Narrowing through off_t here threw that away at the last step: the
+         * offsets that wrapped negative were refused by waste_pread's
+         * `off < 0` guard, which returns -1 without touching errno and prints
+         * as "short read -1: No error", and the ones that wrapped positive
+         * did not fail at all — they quietly read the wrong place, so a run
+         * kept its whole working set inside the first 2 GiB while reporting
+         * the size it was asked for. The default file size is 8 GB, so this
+         * was the default path, and a 2 GiB hot region flatters a consumer
+         * SSD enough to make the number worth more than it is. */
+        int64_t off = (int64_t)(seed % nrec) * (int64_t)g_rec;
         int64_t r = waste_pread(fd, buf, g_rec, off);
         if (r != (int64_t)g_rec) { fprintf(stderr, "short read %lld: %s\n", (long long)r, strerror(errno)); break; }
         got += r;
