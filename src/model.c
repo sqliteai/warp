@@ -164,6 +164,7 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static const char *dump_scores = NULL; /* WASTE_DUMP_SCORES, see moe_layer */
 /* Absolute position of the first token of the pass being routed. The dump
  * names each row by the token it belongs to rather than leaving a reader
  * to infer it from where the layer index wraps — which is a heuristic
@@ -193,6 +194,7 @@ static void model_opts_init(void)
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
     dump_route = getenv("WASTE_DUMP_ROUTE");
+    dump_scores = getenv("WASTE_DUMP_SCORES");
     /* How many of the next layer's experts to fetch on the router's guess.
      * The layer boundary holds about six reads and the prediction's
      * precision falls off past there, so that is the default. 0 is off. */
@@ -2745,6 +2747,32 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+
+    /* WASTE_DUMP_SCORES=path appends one line per (token, layer):
+     *
+     *     pos  L  v0 v1 .. v(E-1)
+     *
+     * the *selection* value for every expert, `score[e] + bias[e]` — the
+     * quantity the loop above ranks on, not the weight it later applies.
+     *
+     * WASTE_DUMP_ROUTE records the ids that won, and no question about a
+     * *different* ranking can be answered from winners alone. Anything that
+     * would reorder the top-K — a residency prior, a dynamic k, a pruning
+     * criterion — needs to know what the experts that lost were worth, and
+     * by how much they lost. A trace of the chosen cannot say.
+     *
+     * Same reasoning as the comment below, and the same economics: this is
+     * one fprintf against a rebuild plus a sweep. */
+    if (dump_scores) {
+        FILE *sf = fopen(dump_scores, "a");
+        if (sf) {
+            fprintf(sf, "%d %d", dump_pos0, L);
+            for (int e = 0; e < E; e++)
+                fprintf(sf, " %.6g", score[e] + (bias ? bias[e] : 0.0f));
+            fputc('\n', sf);
+            fclose(sf);
+        }
+    }
 
     /* WASTE_DUMP_ROUTE=path appends one line per (token, layer):
      *
