@@ -44,6 +44,28 @@ no()   { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 sk()   { printf "  \033[33mSKIP\033[0m  %s — %s\n" "$1" "$2"; skip=$((skip+1)); }
 head_() { printf "\n\033[1m%s\033[0m\n" "$1"; }
 
+# Every bit-identity check in this file rests on `cmp`, which is diffutils —
+# and a bare MSYS2/MinGW install ships neither it nor `diff`. Unguarded, an
+# absent cmp made `cmp -s` false and the suite reported "expert cache changes
+# results": the engine called broken when what is missing is a tool, the one
+# thing line 10 says this suite must never do. Same reason curl is guarded
+# below. Measured on a fresh MSYS2 UCRT64 install, where it turned eight
+# passes into eight failures.
+#
+# 0 = identical, 1 = differ, 2 = no tool to tell with — callers must treat
+# 2 as SKIP, never as either verdict.
+HAVE_CMP=1
+command -v cmp >/dev/null 2>&1 || HAVE_CMP=0
+# cmp's own exit 2 means "could not read a file", which the callers below
+# already treated as a difference — so it is folded into 1 rather than left
+# to collide with the sentinel.
+same() {
+    [ "$HAVE_CMP" = 1 ] || return 2
+    cmp -s "$1" "$2" && return 0
+    return 1
+}
+NO_CMP="cmp not installed (diffutils)"
+
 # uv, with a deadline. A uv that is absent skips cleanly; a uv that is
 # present and cannot work does not fail, it *hangs*, and takes the suite
 # with it — MSYS2's mingw-w64-ucrt-x86_64-uv 0.12.1 opened no TCP sockets
@@ -195,19 +217,31 @@ start_server() {                       # $@ = extra server args; sets PORT, RSRV
 FT="$TMP/fetch"
 mkdir -p "$FT/srv" "$FT/dst"
 if stat --version >/dev/null 2>&1; then SM=gnu; else SM=bsd; fi
-# The path goes in argv, not into the source: MSYS2 rewrites POSIX paths in
-# a native program's arguments and cannot rewrite one quoted inside -c, so
-# Windows Python was handed /tmp/... verbatim and could not find it.
-python3 -c "import sys; open(sys.argv[1],'wb').write(bytes(range(256))*4096)" "$FT/srv/s.bin"
 
-# The worker the downloader generates is curl, so without curl these three
+# The worker the downloader generates is curl, so without curl these five
 # report the downloader broken when what is missing is a tool — which is the
 # one thing this suite says it must never do. Debian slim and a bare MinGW
 # both lack it.
-if ! command -v curl >/dev/null 2>&1; then
-    sk "a truncated shard resumes and verifies against Content-Length" "curl not installed"
-    sk "a completed shard is skipped without a request" "curl not installed"
-    NO_CURL=1
+#
+# range_server.py and the fixture just below are python3, and an absent
+# interpreter falls into the very same trap by a different door: it does not
+# report a missing tool, it reports "range server did not start", which reads
+# as the download script being broken. Measured on a fresh MSYS2 UCRT64
+# install, where it turned all five of these into failures. So the guard
+# carries the reason rather than a flag, and one variable covers both tools.
+DL_MISS=
+command -v python3 >/dev/null 2>&1 || DL_MISS="python3 not installed"
+[ -n "$DL_MISS" ] || command -v curl >/dev/null 2>&1 || DL_MISS="curl not installed"
+
+# The path goes in argv, not into the source: MSYS2 rewrites POSIX paths in
+# a native program's arguments and cannot rewrite one quoted inside -c, so
+# Windows Python was handed /tmp/... verbatim and could not find it.
+[ -n "$DL_MISS" ] ||
+python3 -c "import sys; open(sys.argv[1],'wb').write(bytes(range(256))*4096)" "$FT/srv/s.bin"
+
+if [ -n "$DL_MISS" ]; then
+    sk "a truncated shard resumes and verifies against Content-Length" "$DL_MISS"
+    sk "a completed shard is skipped without a request" "$DL_MISS"
 elif ! start_server; then
     no "range server did not start (resume, state-file skip not run)"
 else
@@ -215,7 +249,10 @@ else
     fetch_worker $PORT $SM
     : > "$FT/dst/.st"
     bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
-    if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin" && grep -q "^s.bin$" "$FT/dst/.st"; then
+    same "$FT/srv/s.bin" "$FT/dst/s.bin"; c=$?
+    if [ $c = 2 ]; then
+        sk "a truncated shard resumes and verifies against Content-Length" "$NO_CMP"
+    elif [ $c = 0 ] && grep -q "^s.bin$" "$FT/dst/.st"; then
         ok "a truncated shard resumes and verifies against Content-Length"
     else
         no "resume"
@@ -252,8 +289,8 @@ fetch_small() {                        # $1 = port, then MODE and file names
 
 echo hello > "$FT/srv/small.txt"
 
-if [ -n "${NO_CURL:-}" ]; then
-    sk "a listed small file survives a transient failure" "curl not installed"
+if [ -n "$DL_MISS" ]; then
+    sk "a listed small file survives a transient failure" "$DL_MISS"
 elif ! start_server --flaky 2; then
     no "range server did not start (small-file retry not run)"
 else
@@ -273,8 +310,8 @@ fi
 # On a clean server, not the flaky one: --flaky counts per path, so a 404
 # there arrives behind two 503s and the check would be measuring both at
 # once.
-if [ -n "${NO_CURL:-}" ]; then
-    sk "a file the repo listed and did not serve is reported, not passed over" "curl not installed"
+if [ -n "$DL_MISS" ]; then
+    sk "a file the repo listed and did not serve is reported, not passed over" "$DL_MISS"
 elif ! start_server; then
     no "range server did not start (small-file accounting not run)"
 else
@@ -294,8 +331,8 @@ else
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
-if [ -n "${NO_CURL:-}" ]; then
-    sk "a server without Range support restarts the shard instead of giving up" "curl not installed"
+if [ -n "$DL_MISS" ]; then
+    sk "a server without Range support restarts the shard instead of giving up" "$DL_MISS"
 elif ! start_server --no-range; then
     no "range server did not start (no-range fallback not run)"
 else
@@ -304,11 +341,12 @@ else
     fetch_worker $PORT $SM
     : > "$FT/dst/.st"
     bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
-    if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin"; then
-        ok "a server without Range support restarts the shard instead of giving up"
-    else
-        no "no-range fallback"
-    fi
+    same "$FT/srv/s.bin" "$FT/dst/s.bin"
+    case $? in
+        0) ok "a server without Range support restarts the shard instead of giving up" ;;
+        1) no "no-range fallback" ;;
+        *) sk "a server without Range support restarts the shard instead of giving up" "$NO_CMP" ;;
+    esac
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
@@ -543,7 +581,9 @@ PY
     fi
 
     WASTE_BACKEND=cpu ./test_forward "$MODEL" "$IDS" "$TMP/cpu.bin" 0 >/dev/null 2>&1
-    if cmp -s "$TMP/seq.bin" "$TMP/cpu.bin"; then
+    # No cmp is not a divergence: it only costs the bit-identity claim, and
+    # the fp-noise bound below is still a real verdict on its own.
+    if same "$TMP/seq.bin" "$TMP/cpu.bin"; then
         ok "SIMD backend bit-identical to the CPU baseline"
     else
         # a difference here is allowed to be tiny, but must be tiny
@@ -561,11 +601,12 @@ PY
     fi
 
     WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" "$TMP/cache.bin" 0 >/dev/null 2>&1
-    if cmp -s "$TMP/seq.bin" "$TMP/cache.bin"; then
-        ok "expert cache is bit-identical to no cache"
-    else
-        no "expert cache changes results"
-    fi
+    same "$TMP/seq.bin" "$TMP/cache.bin"
+    case $? in
+        0) ok "expert cache is bit-identical to no cache" ;;
+        1) no "expert cache changes results" ;;
+        *) sk "expert cache is bit-identical to no cache" "$NO_CMP" ;;
+    esac
 
     # Read-ahead is on by default, so the synchronous path — the fallback,
     # and the thing every earlier measurement was made on — is the one no
@@ -575,11 +616,12 @@ PY
     # had instead of failing.
     WASTE_IO_THREADS=0 WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" \
         "$TMP/sync.bin" 0 >/dev/null 2>&1
-    if cmp -s "$TMP/cache.bin" "$TMP/sync.bin"; then
-        ok "read-ahead is bit-identical to synchronous reads"
-    else
-        no "read-ahead changes results"
-    fi
+    same "$TMP/cache.bin" "$TMP/sync.bin"
+    case $? in
+        0) ok "read-ahead is bit-identical to synchronous reads" ;;
+        1) no "read-ahead changes results" ;;
+        *) sk "read-ahead is bit-identical to synchronous reads" "$NO_CMP" ;;
+    esac
 
     # A trace-driven simulator is only worth having if it models *this*
     # cache. Before this check it did not: it kept a frequency count across
@@ -611,11 +653,12 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
     # prefetch only decides when bytes move, so the logits cannot shift.
     WASTE_LOOKAHEAD=6 WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" \
         "$TMP/look.bin" 0 >/dev/null 2>&1
-    if cmp -s "$TMP/cache.bin" "$TMP/look.bin"; then
-        ok "router lookahead is bit-identical to no lookahead"
-    else
-        no "router lookahead changes results"
-    fi
+    same "$TMP/cache.bin" "$TMP/look.bin"
+    case $? in
+        0) ok "router lookahead is bit-identical to no lookahead" ;;
+        1) no "router lookahead changes results" ;;
+        *) sk "router lookahead is bit-identical to no lookahead" "$NO_CMP" ;;
+    esac
 
     # A purged slot reads back as zeros, so the whole prototype rests on the
     # engine noticing before it multiplies one. This does not create memory
@@ -624,11 +667,12 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
     # no-op and says so.
     WASTE_PURGEABLE=1 WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" \
         "$TMP/purge.bin" 0 >/dev/null 2>&1
-    if cmp -s "$TMP/cache.bin" "$TMP/purge.bin"; then
-        ok "purgeable slots are bit-identical to ordinary ones"
-    else
-        no "purgeable slots change results"
-    fi
+    same "$TMP/cache.bin" "$TMP/purge.bin"
+    case $? in
+        0) ok "purgeable slots are bit-identical to ordinary ones" ;;
+        1) no "purgeable slots change results" ;;
+        *) sk "purgeable slots are bit-identical to ordinary ones" "$NO_CMP" ;;
+    esac
 
     # kimi_ref.py computes its logits *from* a WASTE container, so an oracle
     # is only comparable against the container that produced it — and not
@@ -874,7 +918,10 @@ PY
             sk "mla_use_nope: false rotates" "container not built"
         else
             ./test_forward "$FALSE" "$RIDS" "$TMP/rope_false.bin" 0 >/dev/null 2>&1
-            if [ -s "$TMP/rope_false.bin" ] && cmp -s "$TMP/rope_seq.bin" "$TMP/rope_false.bin"
+            same "$TMP/rope_seq.bin" "$TMP/rope_false.bin"; c=$?
+            if [ $c = 2 ]
+            then sk "mla_use_nope: false rotates" "$NO_CMP"
+            elif [ -s "$TMP/rope_false.bin" ] && [ $c = 0 ]
             then ok "mla_use_nope: false rotates, like the same model without the key"
             else no "mla_use_nope: false was read as NoPE and skipped the rotation"
             fi
@@ -892,10 +939,17 @@ PY
                 --seed 0 "$dir" >/dev/null 2>&1 || { none_ok=0; break; }
             ./test_forward "$dir" "$RIDS" "$TMP/rs_$shape.bin" 0 >/dev/null 2>&1
             [ -s "$TMP/rs_$shape.bin" ] || { none_ok=0; break; }
-            cmp -s "$TMP/rs_drop.bin" "$TMP/rs_$shape.bin" || { none_ok=0; break; }
+            same "$TMP/rs_drop.bin" "$TMP/rs_$shape.bin"
+            case $? in
+                0) ;;
+                2) none_ok=2; break ;;
+                *) none_ok=0; break ;;
+            esac
         done
         if [ "$none_ok" = 1 ]
         then ok "rope_scaling null and {} load as plain RoPE, like no key at all"
+        elif [ "$none_ok" = 2 ]
+        then sk "rope_scaling null and {} load as plain RoPE" "$NO_CMP"
         else no "rope_scaling null or {} did not load as plain RoPE"
         fi
     fi
