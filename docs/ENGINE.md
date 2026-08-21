@@ -383,6 +383,55 @@ alone reproduces the first row to 0.5%, and the penalty survives
 `WASTE_XPAR=1` unchanged (−24.9% against −25.0%), so it is a property of
 where the threads run rather than of how the work is cut.
 
+**How far that generalises: not to a CCX.** Third-party measurement on a
+Ryzen 7 3700X — Zen 2, **one** CCD holding two 4-core CCXs with separate
+16 MB L3 — Kimi-Linear, cache saturated at `--budget 18G` so every arm
+reports the same hit rate and the same bytes, `WASTE_XPAR=1`, three repeats
+per arm, medians:
+
+| 8 threads on | median tok/s |
+|---|---|
+| wherever the OS puts them | 3.72 |
+| `0-7`, one CCX | 3.10 |
+| `8-15`, the other CCX | 2.42 |
+| `0-3,8-11`, split 4+4 | 2.81 |
+
+Read that as **no measurable effect, not as a penalty.** The same run
+included two arms that were the *same* configuration as a control, and they
+came back 3.38 and 3.72 — so anything under about 10–12% is this machine's
+noise, and a second run of the identical grid put the two CCXs in the
+opposite order. What the numbers bound is the size: whatever crossing a CCX
+costs on a single-die part, it is not the 25% that crossing a *die* costs
+above, and it is below what this host can resolve. The option is worth
+reaching for on a multi-CCD machine; on one CCD, leaving placement to the OS
+is not leaving anything on the table.
+
+**Thread count moves far more than placement does, on the same machine.**
+Same container, same budget, same control:
+
+| threads | median tok/s |
+|---|---|
+| 16 — *the default here* | 2.31 |
+| 8 | 3.38–3.72 |
+| 6 | 3.76 |
+
+`--threads 0` is one per CPU the pool may use, and `waste_cpu_count()` counts
+**logical** CPUs — `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)` on Windows,
+`sysconf(_SC_NPROCESSORS_ONLN)` on Linux. On an 8-core part with SMT on that
+is 16, two per core, and it is **~1.6x slower than 6–8**. The apply is a
+dependent `load → address → load` chain, so two siblings on one core split
+its L1 and load/store ports without adding memory-level parallelism — §25's
+"the apply saturates at six threads" arriving on x86 from the other side.
+The plateau at 6 and 8 is one plateau: those two are inside the noise of each
+other, and only the default is clearly off it.
+
+One observation offered rather than concluded: the **first repeat of each arm
+is consistently the slowest** — 1.81 before 2.71/2.31 at 16 threads, 2.60
+before 3.38/3.42 at 8. [issue #37](https://github.com/sqliteai/warp/issues/37)
+reports the same shape on a Strix Halo and reads it as warming rather than as
+an outlier. Two machines, same pattern, so medians over three repeats rather
+than a best-of.
+
 `docs/LEARNED.md` §47 is the same mechanism on a different axis — a pool
 spanning P-cores and E-cores, where the slow participant is slow by speed
 rather than by distance. Both come back to the same structure:
