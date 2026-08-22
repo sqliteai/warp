@@ -167,6 +167,22 @@ void waste_ecache_io_stop(waste_ecache *c);
  * Reads for the first `depth` of them that are not resident start now, and
  * each waste_ecache_get releases one more into the pipe. Calling it with a
  * synchronous cache is a no-op, so call sites need no conditional. */
+/* Residency of a whole layer's experts, without touching any of them.
+ *
+ * `out[e]` becomes 1 when expert e of `layer` is in the cache and READY —
+ * usable with no disk read. Nothing is claimed, no recency moves, and
+ * nothing counts as a hit or a miss: this answers a question, it does not
+ * make a request. INFLIGHT deliberately reads as 0, so "resident" means
+ * arrived rather than asked for.
+ *
+ * One call per layer rather than one per expert because a single mutex
+ * covers the whole cache, and a per-expert probe would take it E times per
+ * layer per token — 83k times a token on K3.
+ *
+ * For a router that wants to prefer experts it already has (arXiv:2412.00099).
+ */
+void waste_ecache_resident_mask(waste_ecache *c, int layer, int n, uint8_t *out);
+
 void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n);
 
 /* Speculative fill for a layer that has not routed yet. Unlike a hint these

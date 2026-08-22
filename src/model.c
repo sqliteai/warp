@@ -164,6 +164,8 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static const char *dump_scores = NULL; /* WASTE_DUMP_SCORES, see moe_layer */
+static float ccr_lambda = 0.0f;        /* WASTE_CCR_LAMBDA, see moe_layer */
 /* Absolute position of the first token of the pass being routed. The dump
  * names each row by the token it belongs to rather than leaving a reader
  * to infer it from where the layer index wraps — which is a heuristic
@@ -193,6 +195,10 @@ static void model_opts_init(void)
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
     dump_route = getenv("WASTE_DUMP_ROUTE");
+    dump_scores = getenv("WASTE_DUMP_SCORES");
+    { const char *s = getenv("WASTE_CCR_LAMBDA");
+      ccr_lambda = s ? (float)atof(s) : 0.0f;
+      if (!(ccr_lambda > 0.0f)) ccr_lambda = 0.0f; }   /* also catches NaN */
     /* How many of the next layer's experts to fetch on the router's guess.
      * The layer boundary holds about six reads and the prediction's
      * precision falls off past there, so that is the default. 0 is off. */
@@ -2723,6 +2729,37 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     float *score = sc + E;
     for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
 
+    /* Cache-conditional routing (arXiv:2412.00099), off unless WASTE_CCR_LAMBDA
+     * asks for it. Experts already in the cache get a bonus **for ranking
+     * only** — `w[j]` below still takes the untouched `score[best]`, so the
+     * gating weights are exactly what the model computed and only the choice
+     * of which K to run moves.
+     *
+     * The bonus is scaled by this layer's own logit range so one lambda means
+     * the same thing in a layer whose scores span 0.9 and one whose scores
+     * span 0.02. The paper uses a running mean of that range; this uses the
+     * range of the token in hand, which needs no per-layer state — and static
+     * mutable state would be wrong here anyway, since waste.h promises several
+     * models can be open in one process.
+     *
+     * This changes what the model outputs. LEARNED §54 is the reason it can
+     * never become a default: "what routing buys is not which experts exist,
+     * nor how they are weighted on average — it is the per-token exclusion",
+     * and this edits precisely that. It is an instrument for measuring the
+     * hit-rate/KL trade, and it stays one until a KL curve says otherwise. */
+    uint8_t resident[1024];
+    float ccr_bump = 0.0f;
+    if (ccr_lambda > 0.0f && E <= (int)sizeof resident) {
+        waste_ecache_resident_mask(&m->cache, L, E, resident);
+        float lo = 1e30f, hi = -1e30f;
+        for (int e = 0; e < E; e++) {
+            const float v = score[e] + (bias ? bias[e] : 0.0f);
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        ccr_bump = ccr_lambda * (hi - lo);
+    }
+
     int idx[64];
     float w[64];
     for (int j = 0; j < K; j++) {
@@ -2732,11 +2769,12 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
             int taken = 0;
             for (int p = 0; p < j; p++) if (idx[p] == e) { taken = 1; break; }
             if (taken) continue;
-            const float v = score[e] + (bias ? bias[e] : 0.0f);
+            float v = score[e] + (bias ? bias[e] : 0.0f);
+            if (ccr_bump > 0.0f && resident[e]) v += ccr_bump;
             if (v > bv) { bv = v; best = e; }
         }
         idx[j] = best;
-        w[j] = score[best];
+        w[j] = score[best];          /* unmodified: ranking moved, gating did not */
     }
     if (c->renorm && K > 1) {
         float s = 0;
@@ -2745,6 +2783,32 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+
+    /* WASTE_DUMP_SCORES=path appends one line per (token, layer):
+     *
+     *     pos  L  v0 v1 .. v(E-1)
+     *
+     * the *selection* value for every expert, `score[e] + bias[e]` — the
+     * quantity the loop above ranks on, not the weight it later applies.
+     *
+     * WASTE_DUMP_ROUTE records the ids that won. Any question about a
+     * *different* ranking needs the ones that lost too: a residency prior
+     * (arXiv:2412.00099) promotes an expert the real router placed outside
+     * the top-K, and a trace of winners cannot say which one or by how much.
+     * So this dumps the whole vector, and the question "would a cache-aware
+     * ranking hit more often, and how far does the distribution move" is
+     * answerable offline — which is the same reasoning, and the same
+     * economics, as the comment below. */
+    if (dump_scores) {
+        FILE *sf = fopen(dump_scores, "a");
+        if (sf) {
+            fprintf(sf, "%d %d", dump_pos0, L);
+            for (int e = 0; e < E; e++)
+                fprintf(sf, " %.6g", score[e] + (bias ? bias[e] : 0.0f));
+            fputc('\n', sf);
+            fclose(sf);
+        }
+    }
 
     /* WASTE_DUMP_ROUTE=path appends one line per (token, layer):
      *

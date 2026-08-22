@@ -593,6 +593,23 @@ void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n)
     ec_unlock(c);
 }
 
+void waste_ecache_resident_mask(waste_ecache *c, int layer, int n, uint8_t *out)
+{
+    if (!out || n <= 0) return;
+    memset(out, 0, (size_t)n);
+    if (!c || c->n_slots <= 0) return;
+
+    ec_lock(c);
+    for (int e = 0; e < n; e++) {
+        const int si = ec_lookup(c, ec_key(layer, e));
+        /* READY only. An INFLIGHT slot has been asked for and has not
+         * arrived, so a router told it was resident would pick it and then
+         * wait on the same read it was trying to avoid. */
+        if (si >= 0 && c->slot[si].state == EC_READY) out[e] = 1u;
+    }
+    ec_unlock(c);
+}
+
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user)
 {
