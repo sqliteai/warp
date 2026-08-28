@@ -281,11 +281,17 @@ def _bind(lib) -> None:
 
 
 def version() -> str:
-    return _lib().waste_version().decode()
+    try:
+        return _lib().waste_version().decode()
+    except EngineError:
+        return "unknown"
 
 
 def build_info() -> str:
-    return _lib().waste_build_info().decode()
+    try:
+        return _lib().waste_build_info().decode()
+    except EngineError:
+        return "unbuilt"
 
 
 def physical_ram() -> int:
