@@ -205,11 +205,19 @@ class ToolParser:
                 self.calls.append(self._current)
                 self._state = "arguments"
         elif marker == _CALL_END:
+            if self._state == "header":
+                self._current = self._parse_header()
+                self.calls.append(self._current)
             if self._current is not None:
                 self._current.json_block = self._arguments
             self._current = None
             self._state = "section"
         elif marker == _SECTION_END:
+            if self._state == "header":
+                self._current = self._parse_header()
+                self.calls.append(self._current)
+            if self._current is not None:
+                self._current.json_block = self._arguments
             self._current = None
             self._state = "content"
         else:
@@ -232,6 +240,9 @@ class ToolParser:
 
     def finish(self) -> None:
         """Flush a call whose arguments the stream ended in the middle of."""
+        if self._state == "header":
+            self._current = self._parse_header()
+            self.calls.append(self._current)
         if self._current is not None:
             self._current.json_block = self._arguments
 

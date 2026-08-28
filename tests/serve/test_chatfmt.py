@@ -693,3 +693,37 @@ class TestKimiK2ToolParser(unittest.TestCase):
         )
 
         self.assertIn(0, delta.tool_calls)
+
+    def test_kimi_tool_call_without_arguments_marker(self):
+        p = self.parser()
+
+        self.feed(p, [
+            (1002, "<|tool_calls_section_begin|>"),
+            (1004, "<|tool_call_begin|>"),
+            (2001, "functions.get_time:0"),
+            (1006, "<|tool_call_end|>"),
+            (1003, "<|tool_calls_section_end|>"),
+            (1001, "<|im_end|>"),
+        ])
+
+        self.assertEqual(len(p.tool_calls), 1)
+        call = p.tool_calls[0]
+        self.assertEqual(call.name, "get_time")
+        self.assertEqual(call.index, 0)
+        self.assertEqual(call.json_block, "")
+
+    def test_kimi_tool_call_stream_ended_in_header(self):
+        p = self.parser()
+
+        self.feed(p, [
+            (1002, "<|tool_calls_section_begin|>"),
+            (1004, "<|tool_call_begin|>"),
+            (2001, "functions.get_time:0"),
+        ])
+        p.finish()
+
+        self.assertEqual(len(p.tool_calls), 1)
+        call = p.tool_calls[0]
+        self.assertEqual(call.name, "get_time")
+        self.assertEqual(call.index, 0)
+        self.assertEqual(call.json_block, "")
