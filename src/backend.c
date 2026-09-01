@@ -57,6 +57,9 @@ const char *waste_register_metal(waste_kernels *t);
 #if defined(WASTE_ENABLE_CUDA)
 const char *waste_register_cuda(waste_kernels *t);
 #endif
+#if defined(WASTE_ENABLE_HIP)
+const char *waste_register_hip(waste_kernels *t);
+#endif
 #if defined(WASTE_ENABLE_BLAS)
 const char *waste_register_blas(waste_kernels *t);
 #endif
@@ -210,6 +213,9 @@ void waste_backend_init(unsigned flags)
 #endif
 #if defined(WASTE_ENABLE_METAL)
     if ((n = waste_register_metal(&waste_k))) g_backend_name = n;
+#endif
+#if defined(WASTE_ENABLE_HIP)
+    if ((n = waste_register_hip(&waste_k))) g_backend_name = n;
 #endif
 #if defined(WASTE_ENABLE_BLAS)
     if ((n = waste_register_blas(&waste_k))) g_backend_name = n;

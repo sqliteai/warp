@@ -176,6 +176,17 @@ CFLAGS += -DWASTE_ENABLE_METAL=1
 OBJCSRC := src/metal.m
 LDLIBS += -framework Metal -framework Foundation
 endif
+ifdef WASTE_ENABLE_HIP
+ifeq (,$(wildcard src/hip.hip))
+$(error WASTE_ENABLE_HIP=1, but src/hip.hip does not exist — the HIP \
+backend is not implemented. Build without the flag: CPU+AVX2 is the \
+default)
+endif
+HIPCC  ?= /opt/rocm/bin/hipcc
+CFLAGS += -DWASTE_ENABLE_HIP=1 -I/opt/rocm/include
+HIPSRC := src/hip.hip
+LDLIBS += -L/opt/rocm/lib -lamdhip64 -lhiprtc
+endif
 ifdef WASTE_ENABLE_CUDA
 ifeq (,$(wildcard src/cuda.cu))
 $(error WASTE_ENABLE_CUDA=1, but src/cuda.cu does not exist — the CUDA \
@@ -197,7 +208,13 @@ SRC    += src/blas.c
 LDLIBS += -lblas
 endif
 
-OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o)
+OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o) $(HIPSRC:.hip=.o)
+
+src/hip.o: src/hip.hip
+	$(HIPCC) -O2 -fPIC -c -o $@ $< -Isrc -I/opt/rocm/include
+
+src/hip.pic.o: src/hip.hip
+	$(HIPCC) -O2 -fPIC -c -o $@ $< -Isrc -I/opt/rocm/include
 
 src/metal.o: src/metal.m
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
@@ -236,7 +253,7 @@ libwaste.a: $(OBJ)
 # than through a second copy of the engine in Python. Built from its own
 # objects because -fPIC is not in CFLAGS for the static path: mixing a
 # non-PIC libwaste.a into a shared object fails to link on Linux.
-SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o)
+SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o) $(HIPSRC:.hip=.pic.o)
 
 %.pic.o: %.c
 	$(CC) $(CFLAGS) $(PICFLAG) -c -o $@ $<
