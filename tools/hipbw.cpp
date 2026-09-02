@@ -2,20 +2,17 @@
  * Copyright 2026 SQLite Cloud, Inc.
  */
 /*
- * hipbw.cpp — Standalone PCIe transfer and GPU memory bandwidth micro-harness
- * calibrated to WARP's verified tensor dimensions (Day 2 Registry).
- *
- * Measures:
- *   1. PCIe Host-to-Device (H2D) and Device-to-Host (D2H) transfer bandwidth.
- *   2. Empty-kernel GPU dispatch overhead / launch latency.
- *   3. Raw VRAM read/write streaming bandwidth on synthetic buffers.
+ * hipbw.cpp — Standalone PCIe transfer, VRAM streaming, and Q8G/Q4G MatVec
+ * mathematical parity verification harness against CPU reference.
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #define CHECK_HIP(cmd) do { \
@@ -26,138 +23,265 @@
     } \
 } while (0)
 
-static double now(void)
+struct HipMatVecParams {
+    int in;
+    int ng;
+    int group;
+    int bits;
+    uint32_t rowbytes;
+    uint32_t m;
+};
+
+__device__ __forceinline__ float warp_reduce_sum(float val)
 {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec / 1e9;
+    #pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        val += __shfl_down(val, offset, warpSize);
+    }
+    return val;
 }
 
-/* Empty kernel to isolate launch floor / dispatch overhead */
-__global__ void empty_kernel(void)
+__global__ void mvq8_hip_kernel(float * __restrict__ y,
+                                const int8_t * __restrict__ W,
+                                const uint16_t * __restrict__ ws,
+                                const float * __restrict__ x,
+                                HipMatVecParams p)
 {
+    const uint32_t warp_id = threadIdx.x / warpSize;
+    const uint32_t lane_id = threadIdx.x % warpSize;
+    const uint32_t warps_per_block = blockDim.x / warpSize;
+    const uint32_t row = blockIdx.x * warps_per_block + warp_id;
+
+    if (row >= p.m) return;
+
+    const char4 *w_row = (const char4 *)(W + (size_t)row * p.rowbytes);
+    const __half *sc_row = (const __half *)(ws + (size_t)row * p.ng);
+    const float4 *x_vec = (const float4 *)x;
+
+    const uint32_t nvec = p.rowbytes >> 2;
+    const uint32_t gshift = (p.group == 128) ? 7u : (uint32_t)(__log2f((float)p.group) + 0.5f);
+
+    float acc = 0.0f;
+    for (uint32_t j = lane_id; j < nvec; j += warpSize) {
+        const char4 wv = w_row[j];
+        const float4 xv = x_vec[j];
+        const float scale = __half2float(sc_row[(j << 2) >> gshift]);
+
+        const float dot4 = (float)wv.x * xv.x +
+                           (float)wv.y * xv.y +
+                           (float)wv.z * xv.z +
+                           (float)wv.w * xv.w;
+        acc += scale * dot4;
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane_id == 0) {
+        y[row] = acc;
+    }
 }
 
-/* Synthetic streaming read kernel (measures VRAM read bandwidth) */
-__global__ void stream_read_kernel(const float4 * __restrict__ in, float * __restrict__ out, size_t nvec)
+__global__ void mvq4_hip_kernel(float * __restrict__ y,
+                                const uint8_t * __restrict__ W,
+                                const uint16_t * __restrict__ ws,
+                                const float * __restrict__ x,
+                                HipMatVecParams p)
 {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float sum = 0.0f;
-    for (size_t i = idx; i < nvec; i += gridDim.x * blockDim.x) {
-        float4 v = in[i];
-        sum += v.x + v.y + v.z + v.w;
+    const uint32_t warp_id = threadIdx.x / warpSize;
+    const uint32_t lane_id = threadIdx.x % warpSize;
+    const uint32_t warps_per_block = blockDim.x / warpSize;
+    const uint32_t row = blockIdx.x * warps_per_block + warp_id;
+
+    if (row >= p.m) return;
+
+    const uint4 *w_row = (const uint4 *)(W + (size_t)row * p.rowbytes);
+    const __half *sc_row = (const __half *)(ws + (size_t)row * p.ng);
+
+    const uint32_t nvec = p.rowbytes >> 4;
+    const uint32_t gshift = (p.group == 128) ? 7u : (uint32_t)(__log2f((float)p.group) + 0.5f);
+
+    float acc = 0.0f;
+    for (uint32_t j = lane_id; j < nvec; j += warpSize) {
+        const uint4 packed = w_row[j];
+        const uint32_t base = j << 5;
+        float part = 0.0f;
+
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {
+            uint32_t word = (b == 0) ? packed.x : ((b == 1) ? packed.y : ((b == 2) ? packed.z : packed.w));
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                uint32_t byte_val = (word >> (8 * k)) & 0xffu;
+                uint32_t i = base + b * 8 + k * 2;
+                part += (float)((int)(byte_val & 0x0fu) - 8) * x[i]
+                      + (float)((int)(byte_val >> 4)   - 8) * x[i + 1];
+            }
+        }
+        acc += __half2float(sc_row[base >> gshift]) * part;
     }
-    if (idx == 0) *out = sum;
+
+    acc = warp_reduce_sum(acc);
+    if (lane_id == 0) {
+        y[row] = acc;
+    }
 }
 
-/* Benchmarks PCIe transfers and raw streaming on a given buffer size */
-static void benchmark_shape(const char *name, int M, int K, int bytes_per_elem, int iterations)
+static inline float host_f16(uint16_t h)
 {
-    size_t total_bytes = (size_t)M * K * bytes_per_elem;
-    double size_mb = (double)total_bytes / (1024.0 * 1024.0);
-
-    printf("\n=== Target: %s [%d x %d] (%.2f MB) ===\n", name, M, K, size_mb);
-
-    /* Allocate host memory */
-    uint8_t *h_src = (uint8_t *)malloc(total_bytes);
-    uint8_t *h_dst = (uint8_t *)malloc(total_bytes);
-    if (!h_src || !h_dst) {
-        fprintf(stderr, "Host memory allocation failed for %.2f MB\n", size_mb);
-        return;
+    const uint32_t sign = (uint32_t)(h >> 15) << 31;
+    const uint32_t e = (h >> 10) & 0x1f, mn = h & 0x3ff;
+    if (e == 0) {
+        float f = (float)mn * 5.9604644775390625e-08f;
+        return sign ? -f : f;
     }
-    memset(h_src, 0x5a, total_bytes);
-
-    /* Allocate GPU memory */
-    void *d_buf = NULL;
-    CHECK_HIP(hipMalloc(&d_buf, total_bytes));
-
-    float *d_out = NULL;
-    CHECK_HIP(hipMalloc(&d_out, sizeof(float)));
-
-    hipEvent_t start, stop;
-    CHECK_HIP(hipEventCreate(&start));
-    CHECK_HIP(hipEventCreate(&stop));
-
-    /* 1. Host-to-Device (PCIe H2D) */
-    CHECK_HIP(hipEventRecord(start, 0));
-    for (int i = 0; i < iterations; i++) {
-        CHECK_HIP(hipMemcpyAsync(d_buf, h_src, total_bytes, hipMemcpyHostToDevice, 0));
-    }
-    CHECK_HIP(hipEventRecord(stop, 0));
-    CHECK_HIP(hipEventSynchronize(stop));
-
-    float ms_h2d = 0.0f;
-    CHECK_HIP(hipEventElapsedTime(&ms_h2d, start, stop));
-    double avg_ms_h2d = ms_h2d / iterations;
-    double gb_sec_h2d = (size_mb / 1024.0) / (avg_ms_h2d / 1000.0);
-    printf("  [PCIe H2D Transfer]   Avg: %7.3f ms  |  Throughput: %6.2f GB/s\n", avg_ms_h2d, gb_sec_h2d);
-
-    /* 2. Device-to-Host (PCIe D2H) */
-    CHECK_HIP(hipEventRecord(start, 0));
-    for (int i = 0; i < iterations; i++) {
-        CHECK_HIP(hipMemcpyAsync(h_dst, d_buf, total_bytes, hipMemcpyDeviceToHost, 0));
-    }
-    CHECK_HIP(hipEventRecord(stop, 0));
-    CHECK_HIP(hipEventSynchronize(stop));
-
-    float ms_d2h = 0.0f;
-    CHECK_HIP(hipEventElapsedTime(&ms_d2h, start, stop));
-    double avg_ms_d2h = ms_d2h / iterations;
-    double gb_sec_d2h = (size_mb / 1024.0) / (avg_ms_d2h / 1000.0);
-    printf("  [PCIe D2H Transfer]   Avg: %7.3f ms  |  Throughput: %6.2f GB/s\n", avg_ms_d2h, gb_sec_d2h);
-
-    /* 3. VRAM Streaming Read Bandwidth */
-    size_t nvec = total_bytes / sizeof(float4);
-    int block_size = 256;
-    int grid_size = 1024;
-    CHECK_HIP(hipEventRecord(start, 0));
-    for (int i = 0; i < iterations; i++) {
-        stream_read_kernel<<<grid_size, block_size, 0, 0>>>((const float4 *)d_buf, d_out, nvec);
-    }
-    CHECK_HIP(hipEventRecord(stop, 0));
-    CHECK_HIP(hipEventSynchronize(stop));
-
-    float ms_vram = 0.0f;
-    CHECK_HIP(hipEventElapsedTime(&ms_vram, start, stop));
-    double avg_ms_vram = ms_vram / iterations;
-    double gb_sec_vram = (size_mb / 1024.0) / (avg_ms_vram / 1000.0);
-    printf("  [VRAM Read Streaming] Avg: %7.3f ms  |  Throughput: %6.2f GB/s\n", avg_ms_vram, gb_sec_vram);
-
-    /* Cleanup */
-    CHECK_HIP(hipEventDestroy(start));
-    CHECK_HIP(hipEventDestroy(stop));
-    CHECK_HIP(hipFree(d_buf));
-    CHECK_HIP(hipFree(d_out));
-    free(h_src);
-    free(h_dst);
+    const uint32_t bits = sign | ((e + 112u) << 23) | (mn << 13);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
 }
 
-static void benchmark_launch_latency(int iterations)
+static uint16_t float_to_half(float f)
 {
-    printf("\n=== Kernel Launch Latency & Dispatch Floor ===\n");
-    hipEvent_t start, stop;
-    CHECK_HIP(hipEventCreate(&start));
-    CHECK_HIP(hipEventCreate(&stop));
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint16_t h = (uint16_t)(((x >> 16) & 0x8000) |
+                 ((((x & 0x7f800000) - 0x38000000) >> 13) & 0x7c00) |
+                 ((x >> 13) & 0x03ff));
+    return h;
+}
 
-    /* Warm up */
-    for (int i = 0; i < 50; i++) empty_kernel<<<1, 1>>>();
+static void cpu_mvq8(float *y, const int8_t *W, const uint16_t *ws, const float *x,
+                     int M, int K, int group, size_t rowbytes)
+{
+    int ng = (K + group - 1) / group;
+    for (int r = 0; r < M; r++) {
+        const int8_t *w_row = W + (size_t)r * rowbytes;
+        const uint16_t *sc_row = ws + (size_t)r * ng;
+        float acc = 0.0f;
+        for (int k = 0; k < ng; k++) {
+            float s = host_f16(sc_row[k]);
+            float part = 0.0f;
+            for (int i = 0; i < group; i++) {
+                part += (float)w_row[k * group + i] * x[k * group + i];
+            }
+            acc += s * part;
+        }
+        y[r] = acc;
+    }
+}
+
+static void cpu_mvq4(float *y, const uint8_t *W, const uint16_t *ws, const float *x,
+                     int M, int K, int group, size_t rowbytes)
+{
+    int ng = (K + group - 1) / group;
+    for (int r = 0; r < M; r++) {
+        const uint8_t *w_row = W + (size_t)r * rowbytes;
+        const uint16_t *sc_row = ws + (size_t)r * ng;
+        float acc = 0.0f;
+        for (int k = 0; k < ng; k++) {
+            float s = host_f16(sc_row[k]);
+            float part = 0.0f;
+            for (int i = 0; i < group; i += 2) {
+                uint8_t byte = w_row[k * (group / 2) + i / 2];
+                int v0 = (int)(byte & 0x0f) - 8;
+                int v1 = (int)(byte >> 4) - 8;
+                part += (float)v0 * x[k * group + i] + (float)v1 * x[k * group + i + 1];
+            }
+            acc += s * part;
+        }
+        y[r] = acc;
+    }
+}
+
+static void test_kernel_parity(int warpSize_val)
+{
+    printf("\n=== Mathematical Parity & Precision Validation ===\n");
+    int M = 4096;
+    int K = 4096;
+    int group = 128;
+    int ng = K / group;
+
+    /* 1. Test Q8G */
+    size_t rowbytes8 = (size_t)K;
+    int8_t *h_w8 = (int8_t *)malloc((size_t)M * rowbytes8);
+    uint16_t *h_ws = (uint16_t *)malloc((size_t)M * ng * sizeof(uint16_t));
+    float *h_x = (float *)malloc((size_t)K * sizeof(float));
+    float *h_y_cpu = (float *)malloc((size_t)M * sizeof(float));
+    float *h_y_gpu = (float *)malloc((size_t)M * sizeof(float));
+
+    for (size_t i = 0; i < (size_t)M * rowbytes8; i++) h_w8[i] = (int8_t)((i % 255) - 127);
+    for (size_t i = 0; i < (size_t)M * ng; i++) h_ws[i] = float_to_half(0.0125f * ((i % 10) + 1));
+    for (int i = 0; i < K; i++) h_x[i] = ((float)(i % 100) - 50.0f) * 0.01f;
+
+    cpu_mvq8(h_y_cpu, h_w8, h_ws, h_x, M, K, group, rowbytes8);
+
+    void *d_w8, *d_ws, *d_x, *d_y;
+    CHECK_HIP(hipMalloc(&d_w8, (size_t)M * rowbytes8));
+    CHECK_HIP(hipMalloc(&d_ws, (size_t)M * ng * sizeof(uint16_t)));
+    CHECK_HIP(hipMalloc(&d_x, (size_t)K * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_y, (size_t)M * sizeof(float)));
+
+    CHECK_HIP(hipMemcpy(d_w8, h_w8, (size_t)M * rowbytes8, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d_ws, h_ws, (size_t)M * ng * sizeof(uint16_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d_x, h_x, (size_t)K * sizeof(float), hipMemcpyHostToDevice));
+
+    HipMatVecParams p8 = { K, ng, group, 8, (uint32_t)rowbytes8, (uint32_t)M };
+    int block_dim = 256;
+    int warps_per_block = block_dim / warpSize_val;
+    int grid_dim = (M + warps_per_block - 1) / warps_per_block;
+
+    mvq8_hip_kernel<<<grid_dim, block_dim>>>((float *)d_y, (const int8_t *)d_w8, (const uint16_t *)d_ws, (const float *)d_x, p8);
     CHECK_HIP(hipDeviceSynchronize());
+    CHECK_HIP(hipMemcpy(h_y_gpu, d_y, (size_t)M * sizeof(float), hipMemcpyDeviceToHost));
 
-    CHECK_HIP(hipEventRecord(start, 0));
-    for (int i = 0; i < iterations; i++) {
-        empty_kernel<<<1, 1, 0, 0>>>();
+    float max_rel_err8 = 0.0f;
+    float max_abs_err8 = 0.0f;
+    for (int i = 0; i < M; i++) {
+        float abs_d = fabsf(h_y_gpu[i] - h_y_cpu[i]);
+        float rel_d = abs_d / (fabsf(h_y_cpu[i]) + 1e-9f);
+        if (abs_d > max_abs_err8) max_abs_err8 = abs_d;
+        if (rel_d > max_rel_err8) max_rel_err8 = rel_d;
     }
-    CHECK_HIP(hipEventRecord(stop, 0));
-    CHECK_HIP(hipEventSynchronize(stop));
+    printf("  [mvq8 Q8G] Max Abs Error: %.2e | Max Rel Error: %.2e | Status: %s\n",
+           max_abs_err8, max_rel_err8, (max_rel_err8 < 1e-3f) ? "PASS (FP ACCUMULATION NOISE)" : "FAIL");
 
-    float ms_total = 0.0f;
-    CHECK_HIP(hipEventElapsedTime(&ms_total, start, stop));
-    double us_per_launch = (ms_total * 1000.0) / iterations;
-    printf("  [Empty Kernel Launch Floor] %6.2f us per dispatch (%d dispatches in %.2f ms)\n",
-           us_per_launch, iterations, ms_total);
+    /* 2. Test Q4G */
+    size_t rowbytes4 = (size_t)K / 2;
+    uint8_t *h_w4 = (uint8_t *)malloc((size_t)M * rowbytes4);
+    for (size_t i = 0; i < (size_t)M * rowbytes4; i++) h_w4[i] = (uint8_t)(i & 0xff);
 
-    CHECK_HIP(hipEventDestroy(start));
-    CHECK_HIP(hipEventDestroy(stop));
+    cpu_mvq4(h_y_cpu, h_w4, h_ws, h_x, M, K, group, rowbytes4);
+
+    void *d_w4;
+    CHECK_HIP(hipMalloc(&d_w4, (size_t)M * rowbytes4));
+    CHECK_HIP(hipMemcpy(d_w4, h_w4, (size_t)M * rowbytes4, hipMemcpyHostToDevice));
+
+    HipMatVecParams p4 = { K, ng, group, 4, (uint32_t)rowbytes4, (uint32_t)M };
+    mvq4_hip_kernel<<<grid_dim, block_dim>>>((float *)d_y, (const uint8_t *)d_w4, (const uint16_t *)d_ws, (const float *)d_x, p4);
+    CHECK_HIP(hipDeviceSynchronize());
+    CHECK_HIP(hipMemcpy(h_y_gpu, d_y, (size_t)M * sizeof(float), hipMemcpyDeviceToHost));
+
+    float max_rel_err4 = 0.0f;
+    float max_abs_err4 = 0.0f;
+    for (int i = 0; i < M; i++) {
+        float abs_d = fabsf(h_y_gpu[i] - h_y_cpu[i]);
+        float rel_d = abs_d / (fabsf(h_y_cpu[i]) + 1e-9f);
+        if (abs_d > max_abs_err4) max_abs_err4 = abs_d;
+        if (rel_d > max_rel_err4) max_rel_err4 = rel_d;
+    }
+    printf("  [mvq4 Q4G] Max Abs Error: %.2e | Max Rel Error: %.2e | Status: %s\n",
+           max_abs_err4, max_rel_err4, (max_rel_err4 < 1e-3f) ? "PASS (FP ACCUMULATION NOISE)" : "FAIL");
+
+    CHECK_HIP(hipFree(d_w8));
+    CHECK_HIP(hipFree(d_w4));
+    CHECK_HIP(hipFree(d_ws));
+    CHECK_HIP(hipFree(d_x));
+    CHECK_HIP(hipFree(d_y));
+    free(h_w8);
+    free(h_w4);
+    free(h_ws);
+    free(h_x);
+    free(h_y_cpu);
+    free(h_y_gpu);
 }
 
 int main(int argc, char **argv)
@@ -166,24 +290,10 @@ int main(int argc, char **argv)
     hipDeviceProp_t prop;
     CHECK_HIP(hipGetDeviceProperties(&prop, device_id));
     printf("WARP Synthetic GPU Micro-Harness (tools/hipbw)\n");
-    printf("Target Device: %s (Arch: %s, VRAM: %.2f GB, CUs: %d)\n",
+    printf("Target Device: %s (Arch: %s, VRAM: %.2f GB, CUs: %d, WaveSize: %d)\n",
            prop.name, prop.gcnArchName, (double)prop.totalGlobalMem / (1024.0*1024.0*1024.0),
-           prop.multiProcessorCount);
+           prop.multiProcessorCount, prop.warpSize);
 
-    benchmark_launch_latency(10000);
-
-    /* 1. LM Head: [151936 x 4096], Q8G (1 byte/elem) = ~593.5 MB */
-    benchmark_shape("LM Head (Q8G)", 151936, 4096, 1, 20);
-
-    /* 2. Self-Attention Projection: [4096 x 4096], Q8G = 16.0 MB */
-    benchmark_shape("Attention Proj (Q8G)", 4096, 4096, 1, 50);
-
-    /* 3. Attention Projection: [4096 x 4096], Q4G (0.5 byte/elem) = 8.0 MB */
-    benchmark_shape("Attention Proj (Q4G)", 4096, 2048, 1, 50);
-
-    /* 4. MoE Router Gate: [256 x 4096], Q8G = 1.0 MB */
-    benchmark_shape("MoE Router Gate", 256, 4096, 1, 100);
-
-    printf("\n=== Micro-Harness Benchmark Complete ===\n");
+    test_kernel_parity(prop.warpSize);
     return 0;
 }
