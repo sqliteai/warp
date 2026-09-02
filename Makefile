@@ -9,6 +9,7 @@
 .DEFAULT_GOAL := all
 
 CC      ?= cc
+HIPCC   ?= /opt/rocm/bin/hipcc
 # gnu11, not c11: with -std=c11 glibc sets __STRICT_ANSI__ and hides every
 # POSIX extension, so pread, fcntl, posix_memalign and pthread_* would all
 # be implicitly declared on Linux. Only model.c defines _GNU_SOURCE itself.
@@ -278,6 +279,9 @@ TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
              test_state test_vision test_vision_glm test_image test_memory \
              test_cpus test_lock sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
+
+tools/hipbw: tools/hipbw.cpp
+	$(HIPCC) -O2 -o $@ $< -L/opt/rocm/lib -lamdhip64
 
 test: $(TESTBINS)
 

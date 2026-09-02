@@ -82,6 +82,25 @@ main() [cli/waste.c]
 
 ---
 
-## 5. Daily Execution Log
+## 5. Empirical Hardware Benchmarks (Day 3 Micro-Harness Data)
+Measured via `tools/hipbw` on AMD Radeon RX 9060 XT (GFX1200 / RDNA):
+
+| Measurement Scenario | Target Tensor Shape | Buffer Size | PCIe Transfer Time / Bandwidth | VRAM Read Time / Bandwidth |
+|---|---|---|---|---|
+| **Dispatch Latency Floor** | Empty Kernel Launch | N/A | N/A | **2.96 µs / dispatch** |
+| **LM Head Output Projection** | $[151936 \times 4096]$ (Q8G) | 593.50 MB | 30.58 ms @ 18.95 GB/s | **2.06 ms @ 280.95 GB/s** |
+| **Self-Attention Projection** | $[4096 \times 4096]$ (Q8G) | 16.00 MB | 0.75 ms @ 20.83 GB/s | **0.035 ms @ 446.82 GB/s** |
+| **Attention Projection (4-bit)**| $[4096 \times 2048]$ (Q4G) | 8.00 MB | 0.45 ms @ 17.38 GB/s | **0.014 ms @ 548.72 GB/s** |
+| **MoE Router Gate Projection** | $[256 \times 4096]$ (Q8G) | 1.00 MB | 0.07 ms @ 13.95 GB/s | **0.008 ms @ 127.75 GB/s** |
+
+### Critical Architectural Takeaway from Day 3:
+- **Zero-Copy / VRAM Residency is Mandatory**: Synchronously transferring 593.5 MB of `lm_head` across PCIe costs **30.58 ms**, destroying all performance. However, executing directly out of resident VRAM takes only **2.06 ms** (a massive **14.8x speedup** over PCIe streaming and **5.7x speedup** over CPU DDR5!).
+- **Low Dispatch Overhead**: The 2.96 µs launch latency confirms that per-layer GPU dispatches (even 60 layers) add less than 0.18 ms total overhead.
+
+---
+
+## 6. Daily Execution Log
 - **Day 1**: Implemented `WASTE_ENABLE_HIP=1` build rules in `Makefile`, created `src/waste_hip.h` and `src/hip.hip`, verified AMD Radeon RX 9060 XT device probing and `WASTE_BACKEND=cpu` fallback.
 - **Day 2**: Completed execution tracing and call-graph mapping of `src/model.c`. Verified exact tensor geometries and single-dispatch `run_rows` entry point for GPU offload.
+- **Day 3**: Built `tools/hipbw` micro-harness. Verified 2.96 µs kernel launch latency, 280–548 GB/s VRAM streaming throughput, and proved empirical necessity of VRAM residency for LM Head.
+
