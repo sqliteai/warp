@@ -13,6 +13,13 @@
 2. **Zero dynamic loading**: Backends are build-time conditional (`WASTE_ENABLE_HIP=1`) and runtime probed via `hipGetDeviceProperties`.
 3. **No PCIe transfer of static weights**: Trunks and LM Head must remain VRAM-resident.
 4. **Instrument before optimizing**: All micro-benchmarks must model real tensor dimensions.
+5. **The 5-Gate Proof Standard (Mitigation #4)**: Never declare a task "implemented" without printed terminal proof:
+   - **Builds** (clean compile, zero warnings)
+   - **Runs** (executes on real hardware without segfaults)
+   - **Tested** (mathematical parity verified with explicit $\epsilon$)
+   - **Benchmarked** (recorded GB/s, tok/s, or latency)
+   - **Git Committed** (clean commit hash on disk)
+6. **"No Commit, No Progress" (Mitigation #5)**: Every working milestone must produce an atomic local git commit. Never write large uncommitted diffs.
 
 ---
 
