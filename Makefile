@@ -277,8 +277,11 @@ waste$(EXE): cli/main.o libwaste.a
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
              test_state test_vision test_vision_glm test_image test_memory \
-             test_cpus test_lock sweep
+             test_cpus test_lock test_hip_parity sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
+
+test_hip_parity$(EXE): tests/test_hip_parity.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tools/hipbw: tools/hipbw.cpp
 	$(HIPCC) -O2 -o $@ $< -L/opt/rocm/lib -lamdhip64
