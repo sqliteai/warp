@@ -20,6 +20,9 @@
    - **Benchmarked** (recorded GB/s, tok/s, or latency)
    - **Git Committed** (clean commit hash on disk)
 6. **"No Commit, No Progress" (Mitigation #5)**: Every working milestone must produce an atomic local git commit. Never write large uncommitted diffs.
+7. **Profile Before Porting (Assumption Challenge #1)**: Do not waste cycles optimizing kernels where AVX-512 already achieves 0.25 ms. Focus exclusively on memory-bus-starved kernels (LM Head @ 593.5 MB) where GPU VRAM bandwidth delivers a massive order-of-magnitude delta.
+8. **Integration-First Discipline (Assumption Challenge #2)**: Treat dispatch routing, memory lifecycle (`waste_hip_release_host_buffers`), and thread synchronization as the primary deliverables, not secondary plumbing.
+9. **The Upstream Quality Bar (Assumption Challenge #3)**: A maintainable, upstreamable 20% speedup with clean C conventions and documentation beats an unmaintainable 80% hack. Keep code simple and upstream-ready.
 
 ---
 
