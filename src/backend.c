@@ -238,4 +238,8 @@ void waste_backend_release_host_buffers(void)
     extern void waste_metal_release_host_buffers(void);
     waste_metal_release_host_buffers();
 #endif
+#if defined(WASTE_ENABLE_HIP)
+    extern void waste_hip_release_host_buffers(void);
+    waste_hip_release_host_buffers();
+#endif
 }

@@ -5,7 +5,8 @@
  * hip.hip — AMD ROCm/HIP backend for WARP.
  *
  * Implements GPU-accelerated quantized matrix-vector multiplication (mvq8/mvq4)
- * with dynamic wavefront reductions and unified dispatch table integration.
+ * with dynamic wavefront reductions, persistent VRAM tensor residency caching,
+ * and unified dispatch table integration.
  */
 
 #include <hip/hip_runtime.h>
@@ -14,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "waste_backend.h"
 #include "waste_hip.h"
@@ -139,17 +141,83 @@ __global__ void mvq4_hip_kernel(float * __restrict__ y,
     }
 }
 
-/* Static temporary buffers for synchronous CPU-GPU bridge */
+/* ---- VRAM Tensor Cache (Linear probing over host addresses) ---- */
+#define HIP_VRAM_SLOTS 8192
+
+typedef struct {
+    const void *host_key;
+    void *d_ptr;
+    size_t size_bytes;
+} hip_tensor_slot;
+
+static hip_tensor_slot g_tensor_cache[HIP_VRAM_SLOTS];
+static pthread_mutex_t g_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t hip_ptr_hash(const void *p)
+{
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (size_t)(x & (HIP_VRAM_SLOTS - 1));
+}
+
+/* Retrieves resident VRAM pointer or transfers host memory to VRAM once */
+static void *hip_get_or_upload_vram(const void *host_ptr, size_t size_bytes)
+{
+    if (!host_ptr || !size_bytes) return NULL;
+
+    pthread_mutex_lock(&g_cache_mu);
+    size_t i = hip_ptr_hash(host_ptr);
+    for (int probe = 0; probe < HIP_VRAM_SLOTS; probe++) {
+        if (g_tensor_cache[i].host_key == host_ptr) {
+            void *ret = g_tensor_cache[i].d_ptr;
+            pthread_mutex_unlock(&g_cache_mu);
+            return ret;
+        }
+        if (!g_tensor_cache[i].host_key) break;
+        i = (i + 1) & (HIP_VRAM_SLOTS - 1);
+    }
+
+    /* First time seeing this host pointer -> allocate resident VRAM & upload */
+    void *d_alloc = NULL;
+    hipError_t err = hipMalloc(&d_alloc, size_bytes);
+    if (err != hipSuccess || !d_alloc) {
+        pthread_mutex_unlock(&g_cache_mu);
+        return NULL; /* Out of VRAM -> fall back to staging or CPU */
+    }
+
+    (void)hipMemcpy(d_alloc, host_ptr, size_bytes, hipMemcpyHostToDevice);
+
+    g_tensor_cache[i].host_key = host_ptr;
+    g_tensor_cache[i].d_ptr = d_alloc;
+    g_tensor_cache[i].size_bytes = size_bytes;
+
+    pthread_mutex_unlock(&g_cache_mu);
+    return d_alloc;
+}
+
+/* Releases all cached VRAM tensor allocations when model is freed */
+extern "C" void waste_hip_release_host_buffers(void)
+{
+    pthread_mutex_lock(&g_cache_mu);
+    for (int i = 0; i < HIP_VRAM_SLOTS; i++) {
+        if (g_tensor_cache[i].d_ptr) {
+            (void)hipFree(g_tensor_cache[i].d_ptr);
+            g_tensor_cache[i].d_ptr = NULL;
+            g_tensor_cache[i].host_key = NULL;
+            g_tensor_cache[i].size_bytes = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mu);
+}
+
+/* Transient scratch buffers for activation vector and output logits */
 static void *d_x_buf = NULL;
 static size_t d_x_cap = 0;
 static void *d_y_buf = NULL;
 static size_t d_y_cap = 0;
-static void *d_w_buf = NULL;
-static size_t d_w_cap = 0;
-static void *d_ws_buf = NULL;
-static size_t d_ws_cap = 0;
 
-static void ensure_scratch(size_t x_bytes, size_t y_bytes, size_t w_bytes, size_t ws_bytes)
+static void ensure_dynamic_scratch(size_t x_bytes, size_t y_bytes)
 {
     if (x_bytes > d_x_cap) {
         if (d_x_buf) (void)hipFree(d_x_buf);
@@ -160,16 +228,6 @@ static void ensure_scratch(size_t x_bytes, size_t y_bytes, size_t w_bytes, size_
         if (d_y_buf) (void)hipFree(d_y_buf);
         (void)hipMalloc(&d_y_buf, y_bytes);
         d_y_cap = y_bytes;
-    }
-    if (w_bytes > d_w_cap) {
-        if (d_w_buf) (void)hipFree(d_w_buf);
-        (void)hipMalloc(&d_w_buf, w_bytes);
-        d_w_cap = w_bytes;
-    }
-    if (ws_bytes > d_ws_cap) {
-        if (d_ws_buf) (void)hipFree(d_ws_buf);
-        (void)hipMalloc(&d_ws_buf, ws_bytes);
-        d_ws_cap = ws_bytes;
     }
 }
 
@@ -195,12 +253,22 @@ static void hip_mvq_rows_f32(int b, int e, void *arg)
     size_t w_bytes = (size_t)m * a->rowbytes;
     size_t ws_bytes = (size_t)m * a->ng * sizeof(uint16_t);
 
-    ensure_scratch(x_bytes, y_bytes, w_bytes, ws_bytes);
+    /* Check or register persistent VRAM residency for weights and scales */
+    void *d_w = hip_get_or_upload_vram(a->W + (size_t)b * a->rowbytes, w_bytes);
+    void *d_ws = hip_get_or_upload_vram(a->ws + (size_t)b * a->ng, ws_bytes);
 
-    /* Transfer inputs */
+    /* If VRAM allocation failed, fall back to CPU execution */
+    if (!d_w || !d_ws) {
+        if (waste_k.mvq_rows_cpu) {
+            waste_k.mvq_rows_cpu(b, e, arg);
+            return;
+        }
+    }
+
+    ensure_dynamic_scratch(x_bytes, y_bytes);
+
+    /* Only activation vector x is transferred across PCIe during decode! */
     (void)hipMemcpyAsync(d_x_buf, a->xq ? (const void *)a->xq : (const void *)a->xs, x_bytes, hipMemcpyHostToDevice, 0);
-    (void)hipMemcpyAsync(d_w_buf, a->W + (size_t)b * a->rowbytes, w_bytes, hipMemcpyHostToDevice, 0);
-    (void)hipMemcpyAsync(d_ws_buf, a->ws + (size_t)b * a->ng, ws_bytes, hipMemcpyHostToDevice, 0);
 
     int block_dim = 256;
     int warps_per_block = block_dim / g_wavefront_size;
@@ -208,15 +276,15 @@ static void hip_mvq_rows_f32(int b, int e, void *arg)
 
     if (a->bits == 8) {
         hipLaunchKernelGGL(mvq8_hip_kernel, dim3(grid_dim), dim3(block_dim), 0, 0,
-                           (float *)d_y_buf, (const int8_t *)d_w_buf, (const uint16_t *)d_ws_buf,
+                           (float *)d_y_buf, (const int8_t *)d_w, (const uint16_t *)d_ws,
                            (const float *)d_x_buf, p);
     } else if (a->bits == 4) {
         hipLaunchKernelGGL(mvq4_hip_kernel, dim3(grid_dim), dim3(block_dim), 0, 0,
-                           (float *)d_y_buf, (const uint8_t *)d_w_buf, (const uint16_t *)d_ws_buf,
+                           (float *)d_y_buf, (const uint8_t *)d_w, (const uint16_t *)d_ws,
                            (const float *)d_x_buf, p);
     }
 
-    /* Retrieve results */
+    /* Retrieve final output vector (e.g. 600 KB for vocab) */
     (void)hipMemcpy(a->y + b, d_y_buf, y_bytes, hipMemcpyDeviceToHost);
 }
 
