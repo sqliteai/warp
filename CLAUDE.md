@@ -261,15 +261,17 @@ Stdlib-only OpenAI-compatible HTTP. `xtml.py` is a **port** of the release's
 against that file whenever `K3_DIR` is set; `regions.py` is the streaming
 parser that reads replies back into reasoning / content / `tool_calls`;
 `chatfmt.py` is the fallback for a container with no XTML markers, serving
-it from the same `chat.json` the CLI reads — plain conversation only, with
-tools, thinking and images refused by name rather than dropped;
-`kimitools.py` is Kimi's native tool-call protocol — the five markers, the
-rendering and the reply reader — which is neither of the two formats and so
-gets its own module: it is carried in a container's *tokenizer* while its
-`chat.json` says nothing about it, and Kimi-Linear ships those tokens with
-no chat template at all. `tests/serve/test_chatfmt_upstream.py` diffs it
-against K2's published one, `K2_DIR` naming the release, the way
-`test_xtml` does for K3;
+it from the same `chat.json` the CLI reads — plain conversation, with
+thinking and images from the format and everything else refused by name
+rather than dropped; `kimitools.py` and `glmtools.py` are the two native
+tool-call protocols a container's *tokenizer* can carry while its
+`chat.json` says nothing about them — Kimi K2's five control tokens and
+GLM-5.3-Flash's `<tool_call>` XML grammar, each with its rendering and its
+reply reader, enabled only when the whole marker set resolves.
+`tests/serve/test_chatfmt_upstream.py` diffs the first against K2's
+published one and `tests/serve/test_glm_upstream.py` the second against
+GLM's, `K2_DIR`/`GLM_DIR` naming the release, the way `test_xtml` does for
+K3;
 `engine.py` is the ctypes binding plus one lock held for a whole generation
 (a `waste_ctx` is not thread-safe). Struct layouts in `engine.py` mirror
 `waste.h` field for field — change one, change the other.

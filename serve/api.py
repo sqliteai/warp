@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from . import chatfmt, kimitools, xtml
+from . import chatfmt, glmtools, kimitools, xtml
 from .engine import Engine
 from .regions import RegionParser
 
@@ -384,6 +384,8 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     except xtml.XTMLError as e:
         raise APIError(str(e), param="messages")
     except kimitools.KimiToolError as e:
+        raise APIError(str(e), param=e.param or "messages")
+    except glmtools.GlmToolError as e:
         raise APIError(str(e), param=e.param or "messages")
 
     tokens = engine.tokenize_segments(segments)

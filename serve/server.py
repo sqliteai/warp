@@ -40,7 +40,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import api, xtml
+from . import api, glmtools, xtml
 from .chatfmt import ChatFormat, ChatFormatError, PlainParser
 from .engine import Cancelled, Engine, EngineError
 from .regions import RegionParser
@@ -141,10 +141,17 @@ class ChatServer(ThreadingHTTPServer):
             return RegionParser(in_think=thinking, in_response=not thinking,
                                 markers=self.markers)
         fmt = self.chat_format
+        # Which tool protocol the reply reader should own: a GLM container
+        # speaks its own `<tool_call>` grammar, anything else that reaches
+        # a PlainParser speaks Kimi K2's five control tokens.
+        tool_parser = None
+        if getattr(fmt, "tool_protocol", "") == "glm":
+            tool_parser = glmtools.ToolParser()
         return PlainParser(markers=self.markers,
                            think_close_id=getattr(fmt, "think_close_id", -1),
                            in_think=thinking and getattr(fmt, "think", None)
-                           is not None)
+                           is not None,
+                           tool_parser=tool_parser)
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.

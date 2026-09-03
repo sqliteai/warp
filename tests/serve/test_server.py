@@ -1001,3 +1001,99 @@ class TestKimiK2ToolsFromChatJson(TestChatFromChatJson):
 
         self.assertEqual(reasons, ["tool_calls"])
         self.assertEqual(events[-1], "[DONE]")
+
+
+# ---------------------------------------------------------------------------
+# GLM's native <tool_call> tool protocol over the real HTTP surface
+# ---------------------------------------------------------------------------
+
+class TestGlmToolsFromChatJson(ServerTestCase):
+    """The GLM counterpart of TestKimiK2ToolsFromChatJson: a chat.json
+    container whose tokenizer carries GLM-5.3-Flash's XML tool grammar
+    instead of Kimi K2's five control tokens.
+
+    Unlike Kimi-Linear, GLM's format always opens a reasoning channel, so it
+    inherits from `ServerTestCase` (which provides the chat/stream helpers)
+    rather than from `TestChatFromChatJson`, whose inherited cases assume
+    the Kimi container's semantics — thinking off by default, and tools
+    refused."""
+
+    from tests.serve.test_glmtools import GLM_MARKERS  # noqa: E402
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="serve-glm-tools-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        shutil.copyfile(REPO / "examples" / "chat-glm53.json",
+                        Path(self.dir) / "chat.json")
+        self.engine_kwargs = {"no_markers": True, "model_path": self.dir,
+                              "markers": dict(self.GLM_MARKERS)}
+        # GLM's format always opens the reasoning channel, so default the
+        # server to thinking on, which is also the server's default.
+        ServerTestCase.setUp(self)
+
+    @staticmethod
+    def glm_tool_reply():
+        return (
+            "I'll check the weather.\n"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>Rome</arg_value></tool_call>\n"
+        )
+
+    def test_tools_are_enabled_by_the_glm_markers(self):
+        """GLM's <tool_call> grammar, not Kimi's, enables the tool request."""
+        self.engine.reply = self.glm_tool_reply()
+        status, body = self.chat(tools=[{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }])
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        calls = body["choices"][0]["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome"})
+
+    def test_glm_tool_call_streaming(self):
+        self.engine.reply = self.glm_tool_reply()
+        events = self.stream(tools=[{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }])
+        name = None
+        arguments = ""
+        index = None
+        for event in events[:-1]:
+            for choice in event.get("choices", []):
+                for call in choice.get("delta", {}).get("tool_calls", []):
+                    index = call.get("index", index)
+                    fn = call.get("function", {})
+                    if fn.get("name"):
+                        name = fn["name"]
+                    arguments += fn.get("arguments", "")
+        self.assertEqual(index, 0)
+        self.assertEqual(name, "get_weather")
+        self.assertEqual(json.loads(arguments), {"city": "Rome"})
+        reasons = [
+            choice["finish_reason"]
+            for event in events[:-1]
+            if isinstance(event, dict)
+            for choice in event.get("choices", [])
+            if choice.get("finish_reason")]
+        self.assertEqual(reasons, ["tool_calls"])
+        self.assertEqual(events[-1], "[DONE]")
+
+    def test_a_malformed_glm_tool_call_is_a_400(self):
+        """A call with no function name trips GlmToolError, mapped to a 400
+        naming the field — the same API surface as Kimi's KimiToolError."""
+        status, body = self.chat(messages=[{
+            "role": "assistant", "content": "", "tool_calls": [{}]}])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["param"],
+                         "messages[0].tool_calls[0].function.name")
