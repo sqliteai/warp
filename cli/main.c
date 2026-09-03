@@ -324,6 +324,7 @@ typedef struct {
     uint32_t n;
     uint64_t hit, miss;
     double ms;
+    uint64_t bytes_read;
     const char *stop;              /* --stop, or NULL                       */
     char *pend;                    /* held back until the stop can't match  */
     size_t pend_n, pend_cap;
@@ -340,6 +341,7 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
     s->hit += i->experts_hit;
     s->miss += i->experts_missed;
     s->ms += i->ms_total;
+    s->bytes_read += i->bytes_read;
 
     if (!s->stop || !*s->stop) {
         if (!s->quiet) { fputs(piece, stdout); fflush(stdout); }
@@ -874,10 +876,11 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     if (show_stats && s.n) {
         const double sec = s.ms / 1000.0;
         fprintf(stderr, "\n[%u tokens, %.2f s, %.2f tok/s | experts %llu hit / "
-                        "%llu miss = %.0f%%]\n",
+                        "%llu miss = %.0f%% | %.2f GB read\]\n",
                 s.n, sec, s.n / sec,
                 (unsigned long long)s.hit, (unsigned long long)s.miss,
-                100.0 * (double)s.hit / (double)(s.hit + s.miss ? s.hit + s.miss : 1));
+                100.0 * (double)s.hit / (double)(s.hit + s.miss ? s.hit + s.miss : 1),
+                (double)s.bytes_read / (1ULL << 30));
     }
     return 0;
 }
