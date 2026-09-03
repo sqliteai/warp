@@ -443,17 +443,19 @@ It supports streaming, tools, structured output, thinking controls, and images. 
 
 A GLM container is served the same way, from its own `chat.json`: plain
 conversation and images, with the reasoning channel returned as
-`reasoning_content` beside `content`. Tools are refused by name rather than
-half-rendered — four strings cannot express a tool declaration, and GLM's
-tokenizer carries no protocol that could.
+`reasoning_content` beside `content`. Tools work here too: GLM's tokenizer
+carries its own tool protocol (`<tool_call>`, `<arg_key>`, `<arg_value>`)
+as single tokens, so `serve/glmtools.py` renders a request and reads a
+reply the way GLM's own `chat_template.jinja` spells them — flat XML, an
+`<|observation|>` turn for results.
 
-Kimi-Linear's does. Since 0.7.2 a container whose tokenizer holds all five
-of Kimi's native tool-call markers gets tool calling over HTTP even though
-its `chat.json` describes only the ordinary turns — the format lives in
-`serve/kimitools.py`, and the server says which of the three capabilities a
-container has when it starts. All five or none: half of that rendering
-encodes as ordinary text, so a partial set is a different protocol rather
-than a smaller one.
+Kimi-Linear's is the other one. Since 0.7.2 a container whose tokenizer
+holds all five of Kimi's native tool-call markers gets tool calling over
+HTTP even though its `chat.json` describes only the ordinary turns — the
+format lives in `serve/kimitools.py`, and the server says which of the
+three capabilities a container has when it starts. All or none, for either
+protocol: half of that rendering encodes as ordinary text, so a partial set
+is a different protocol rather than a smaller one.
 
 ```bash
 python3 -m serve ~/models/glm53.waste --port 8000

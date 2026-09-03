@@ -18,10 +18,13 @@ What that buys, and what it does not:
 
 - **Plain conversation, streaming included.** system / user / assistant
   turns, and a stop that comes from the format rather than from a guess.
-- **No tools.** Four strings cannot express a tool declaration, an argument
-  list, or a result turn. K3's encoder needs 647 lines for that, and the
-  markup Kimi-Linear's tokenizer carries for it is not transcribed anywhere
-  in this repo. Refused, by name, rather than half-rendered.
+- **Tools, when the tokenizer carries a protocol for them.** Four strings
+  cannot express a tool declaration, an argument list, or a result turn, so
+  neither Kimi K2's five control tokens nor GLM's `<tool_call>` XML grammar
+  live in chat.json. They live in the tokenizer, `kimitools` and `glmtools`
+  render whichever one a container carries, and a container whose
+  vocabulary has neither refuses a `tools` request by name rather than
+  half-rendering it.
 - **A reasoning channel, when the format names one.** `chat.json` may
   carry `think: ["<think>", "</think>"]`, and GLM-5.3-Flash's does: its
   generation prompt opens the channel and the model closes it before the
@@ -57,7 +60,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import kimitools
+from . import glmtools, kimitools
 from .regions import Delta, ToolCall
 from .xtml import Segment
 
@@ -114,6 +117,12 @@ class ChatFormat:
     effort: str = ""
     image: str = ""
     tool_markers: dict[int, str] = field(default_factory=dict)
+    # Which native tool protocol `tool_markers` resolved to: "kimi" for
+    # Kimi K2's five control tokens, "glm" for GLM's `<tool_call>` XML
+    # grammar, or "" when the tokenizer carries neither. The renderer and
+    # the reply reader branch on this, because the two grammars differ in
+    # what a call, a declaration and a result turn look like.
+    tool_protocol: str = ""
 
     @property
     def markers(self) -> dict[int, str]:
@@ -231,16 +240,26 @@ class ChatFormat:
                     f"chat format disagree")
             ids[text] = got[0]
 
-        # A container may carry Kimi's native tool protocol in reserved
+        # A container may carry a native tool protocol in reserved
         # tokenizer tokens even though chat.json describes only the ordinary
         # turns. Whether it does is this file's question; what the protocol
-        # is belongs to kimitools.
+        # is belongs to kimitools or glmtools. Kimi first keeps the existing
+        # behaviour, and the two grammars are disjoint so a real container
+        # resolves at most one.
+        protocol = ""
         discovered = kimitools.detect(engine)
+        if discovered:
+            protocol = "kimi"
+        else:
+            discovered = glmtools.detect(engine)
+            if discovered:
+                protocol = "glm"
 
         return cls(roles=roles, opening=opening, stop_marker=stop_marker,
                    stop_id=ids[stop_marker], prelude=prelude, think=think,
                    think_close_id=ids[think[1]] if think else -1,
-                   effort=effort, image=image, tool_markers=discovered)
+                   effort=effort, image=image, tool_markers=discovered,
+                   tool_protocol=protocol)
 
     # ---- rendering ------------------------------------------------------
 
@@ -283,11 +302,15 @@ class ChatFormat:
                 raise ChatFormatError(
                     "this container is served from its chat.json, which "
                     "cannot express tool definitions because its tokenizer "
-                    "does not carry the Kimi K2 native tool markers",
+                    "carries neither the Kimi K2 native tool markers nor "
+                    "GLM's <tool_call> XML protocol",
                     param="tools",
                 )
 
-            segments.extend(kimitools.declaration(tools))
+            if self.tool_protocol == "glm":
+                segments.extend(glmtools.declaration(tools))
+            else:
+                segments.extend(kimitools.declaration(tools))
         for name in ("tool_choice", "response_format", "response_schema"):
             if kwargs.get(name) is not None:
                 raise ChatFormatError(
@@ -332,8 +355,24 @@ class ChatFormat:
             role = _ROLE_ALIASES.get(role, role)
 
             # Kimi K2 represents a tool result as a system-style turn whose
-            # content begins with "## Return of <tool_call_id>".
+            # content begins with "## Return of <tool_call_id>"; GLM opens an
+            # <|observation|> turn and wraps each result in
+            # <tool_response>…</tool_response>. Both are the authored side of
+            # the protocol, so which one lives in this file as turn framing
+            # and which lives in the tool module is the same split as with
+            # the role prefixes — the protocol only decides the body.
             if role == "tool":
+                if self.tool_protocol == "glm":
+                    # The template groups consecutive tool results under a
+                    # single <|observation|>, one block per result. Look back
+                    # so a run of results shares an opener, exactly as GLM's
+                    # template does (`loop.first or the last role != "tool"`).
+                    if i == 0 or messages[i - 1].get("role") != "tool":
+                        segments.append(Segment(glmtools.OBSERVATION,
+                                                markup=True))
+                    segments.extend(glmtools.tool_response(
+                        _content_segments(message.get("content"), i)))
+                    continue
                 pair = self.roles.get("system")
                 if pair is None:
                     raise ChatFormatError(
@@ -363,7 +402,10 @@ class ChatFormat:
                         f"messages[{i}] carries tool_calls on a non-assistant "
                         "turn",
                         param=f"messages[{i}].tool_calls")
-                segments.extend(kimitools.call_section(tool_calls, i))
+                if self.tool_protocol == "glm":
+                    segments.extend(glmtools.call_section(tool_calls, i))
+                else:
+                    segments.extend(kimitools.call_section(tool_calls, i))
 
             segments.append(Segment(suffix, markup=True))
 
@@ -418,14 +460,20 @@ def _content_segments(content: Any, index: int, images: Any = None) -> list[Segm
 
 
 class PlainParser:
-    """Read a chat.json reply, including Kimi K2 native tool calls.
+    """Read a chat.json reply, including native tool calls.
+
+    The reply is read back whichever tool protocol the container carries —
+    Kimi K2's five control tokens or GLM's `<tool_call>` XML grammar — by
+    whichever `tool_parser` the caller hands in (Kimi by default, for the
+    containers that were here first).
 
     Structure is recognized only from tokenizer marker ids. Marker-looking
     text carried by an ordinary token remains ordinary model content.
     """
 
     def __init__(self, *, markers: Optional[dict[int, str]] = None,
-                 think_close_id: int = -1, in_think: bool = False):
+                 think_close_id: int = -1, in_think: bool = False,
+                 tool_parser: Any = None):
         self._markers = dict(markers or {})
         # The channel, when the format has one. `in_think` says the
         # generation prompt left it open — which for GLM it always does —
@@ -440,7 +488,8 @@ class PlainParser:
         # The tool protocol reads itself; this file decides only what is
         # left over. `tool_calls` stays an attribute here because it is what
         # openai_message reports.
-        self._tools = kimitools.ToolParser()
+        self._tools = tool_parser if tool_parser is not None \
+            else kimitools.ToolParser()
 
     @property
     def finished(self) -> bool:

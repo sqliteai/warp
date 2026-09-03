@@ -136,35 +136,47 @@ startup the server asks for the richer format first and falls back:
 
 ```
 chat     from ~/models/kimi-linear.waste/chat.json — plain conversation, no reasoning channel,
-         no images, native tools
+         no images, kimi tools
 chat     from ~/models/glm53.waste/chat.json — plain conversation, a reasoning channel,
-         images, no tools
+         images, glm tools
 ```
 
 The three capabilities are read from the container, never assumed: the
 channel and the images from `chat.json`, the tools from whether the
-tokenizer carries **all five** of Kimi's native tool-call markers as single
-tokens. Kimi-Linear does; GLM does not, and is refused by name.
+tokenizer carries a whole native tool protocol as single tokens. There are
+two of them: **all five** of Kimi K2's markers, which Kimi-Linear carries,
+or **all nine** of GLM's, which GLM-5.3-Flash does — `<tool_call>`,
+`</tool_call>`, `<arg_key>`, `</arg_key>`, `<arg_value>`, `</arg_value>`,
+`<tool_response>`, `</tool_response>` and `<|observation|>`. A container
+with neither is refused by name.
 
 That last one is a rendering `chat.json` itself cannot describe — four
 prefix/suffix strings say nothing about a tool declaration or an argument
-list — so the protocol lives in `serve/kimitools.py`, its own module beside
-`xtml.py`, and is enabled only when the whole marker set resolves.
+list — so each protocol lives in its own module beside `xtml.py`
+(`serve/kimitools.py`, `serve/glmtools.py`), and is enabled only when the
+whole marker set resolves.
 
 The split is by subject rather than by size. *Whether* a container can do
 tools is a fact about its `chat.json` and its tokenizer, so `chatfmt.py`
 decides it and refuses with `ChatFormatError`. *How* a tool call is spelled
-is a fact about the protocol, so `kimitools.py` owns it and a malformed one
-raises `KimiToolError` — the same shape `xtml.py` has with `XTMLError`, and
-`api.py` maps each to a 400. Nothing in `kimitools.py` imports `chatfmt`,
-which is what lets `chatfmt` import it. **It is Kimi K2's**, and it is checked
-against K2's own published `chat_template.jinja` rather than transcribed
-from memory: `tests/serve/test_chatfmt_upstream.py`, which `tests/run.sh`
-runs whenever `K2_DIR` names a release directory, the same discipline
-`test_xtml.TestAgainstUpstream` applies to K3 with `K3_DIR`. Kimi-Linear's
-own release carries the five tokens and **no chat template at all**, which
-is why the grammar has to come from K2 and why an oracle for it matters
-more than usual.
+is a fact about the protocol, so `kimitools.py` or `glmtools.py` owns it and
+a malformed one raises `KimiToolError` or `GlmToolError` — the same shape
+`xtml.py` has with `XTMLError`, and `api.py` maps each to a 400. Nothing in
+either imports `chatfmt`, which is what lets `chatfmt` import them. Each is
+**the release's own grammar**, checked against the template that defines it
+rather than transcribed from memory:
+`tests/serve/test_chatfmt_upstream.py`, which `tests/run.sh` runs whenever
+`K2_DIR` names a release directory, and `tests/serve/test_glm_upstream.py`
+for `GLM_DIR` — the same discipline `test_xtml.TestAgainstUpstream` applies
+to K3 with `K3_DIR`. Kimi-Linear's own release carries the five tokens and
+**no chat template at all**, which is why the grammar has to come from K2
+and why an oracle for it matters more than usual; GLM's release ships its
+template, and the two grammars differ enough that each gets its own module
+and its own reader — a Kimi call is `ID<|tool_call_argument_begin|>ARGS` in
+a section, a GLM call is flat XML with the name after the opening tag and
+one `<arg_key>`/`<arg_value>` pair per argument, and a GLM result is an
+`<|observation|>` turn wrapping `<tool_response>` blocks where a Kimi result
+is a system turn named for the tool.
 
 One difference from that template is deliberate and asserted rather than
 fixed: with no system turn first, K2's template inserts Moonshot's own

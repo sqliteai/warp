@@ -2165,5 +2165,27 @@ else
     fi
 fi
 
+# And for the third: GLM's release ships its chat_template, and GLM's tool
+# grammar (`<tool_call>`, `<arg_key>`, `<arg_value>`) is that template's, not
+# anything this repo owns. Same rule — diff the rendering against it. Needs
+# the loopcontrols extension too, because the template uses `{% break %}`.
+GLM_SRC="${GLM_DIR:-$HOME/models/glm53.waste}"
+if [ ! -f "$GLM_SRC/chat_template.jinja" ] && [ ! -f "$GLM_SRC/tokenizer_config.json" ]; then
+    sk "chat.json tools vs GLM's chat_template" \
+       "no template at $GLM_SRC (set GLM_DIR; only chat_template.jinja is needed)"
+elif [ -n "$PY_MISS" ]; then
+    sk "chat.json tools vs GLM's chat_template" "$PY_MISS"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "chat.json tools vs GLM's chat_template" "uv not installed (needs jinja2)"
+else
+    if GLM_DIR="$GLM_SRC" run_uv run --no-project --with jinja2 \
+           python -m unittest tests.serve.test_glm_upstream 2>&1 \
+           | tail -3 | grep -q "^OK"; then
+        ok "chat.json tool rendering matches GLM's own chat_template"
+    else
+        no "chat.json tool rendering differs from GLM's chat_template"
+    fi
+fi
+
 printf "\n\033[1m%d passed, %d failed, %d skipped\033[0m\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]

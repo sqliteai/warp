@@ -331,10 +331,15 @@ advances `low` to `content_height + 1` rather than to the aligned height.
   release. A container converted from a release that shares a selection
   across layers is refused rather than produced.
 - **MTP.** The extra prediction layer is dropped, as above.
-- **Tools.** GLM's template carries a full tool-call protocol; the
-  declarative `chat.json` cannot express one and refuses by name rather
-  than half-rendering it. The raw `.jinja` is in the container for a host
-  that does interpret Jinja.
+- **Tools.** GLM's template carries a full tool-call protocol, and the
+  declarative `chat.json` cannot express one — so the server renders it
+  from the tokenizer instead. GLM's specials carry the whole XML grammar
+  (`<tool_call>`, `<arg_key>`, `<arg_value>` and the response/observation
+  markers) as single tokens, `serve/glmtools.py` renders and reads it back
+  the way the release's own `chat_template.jinja` spells it, and
+  `tests/serve/test_glm_upstream.py` diffs that rendering against the
+  template with `GLM_DIR` naming the release. The raw `.jinja` stays in the
+  container for a host that does interpret Jinja.
 
 ## What is checked
 

@@ -249,7 +249,8 @@ examples:
         think = ("a reasoning channel" if srv.chat_format.think
                  else "no reasoning channel")
         images = "images" if srv.chat_format.image else "no images"
-        tools = "native tools" if srv.chat_format.tool_markers else "no tools"
+        protocol = srv.chat_format.tool_protocol
+        tools = f"{protocol} tools" if protocol else "no tools"
         print(f"chat     from {model}/chat.json — plain conversation, "
               f"{think},\n         {images}, {tools}")
 
