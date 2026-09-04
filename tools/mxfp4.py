@@ -122,7 +122,8 @@ class ST:
         with open(os.path.join(self.dir, fn), "rb") as f:
             f.seek(base + beg)
             buf = bytearray(f.read(end - beg))
-        dt = {"U8": torch.uint8, "I8": torch.int8, "BF16": torch.bfloat16,
+        dt = {"U8": torch.uint8, "I8": torch.int8, "I64": torch.int64,
+              "BF16": torch.bfloat16,
               "F16": torch.float16, "F32": torch.float32,
               # fp8 is how the current generation of large MoEs ships — K2,
               # DeepSeek V3/R1. The values are read natively; the per-block

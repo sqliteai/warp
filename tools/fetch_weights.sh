@@ -27,6 +27,13 @@
 #   tools/fetch_weights.sh                    # start or resume
 #   tools/fetch_weights.sh --check            # verify what is on disk, no fetch
 #   tools/fetch_weights.sh --repo moonshotai/Kimi-Linear --dest /data/kl
+#   tools/fetch_weights.sh --repo Qwen/Qwen3.8-Flash-Next \
+#       --revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
+#       --dest /Users/admin/mnt/llm/qwen38-flash-next/raw --dry-run
+#
+# --revision pins every fetch URL (API listing, small files, shards).
+# Omit it and the script uses main, which moves. Qwen3.8-Flash-Next
+# must pass the SHA recorded in docs/QWEN.md.
 #
 # Set HF_TOKEN for a gated repo. Safe to run repeatedly and safe to kill:
 # the next run picks up where it stopped, mid-shard.
@@ -54,6 +61,7 @@ fi
 export PY
 
 REPO="${REPO:-moonshotai/Kimi-K3}"
+REVISION="${REVISION:-main}"
 DEST="${DEST:-/Volumes/WasteDisk/k3}"
 JOBS="${JOBS:-3}"
 MAX_RETRY="${MAX_RETRY:-8}"
@@ -66,17 +74,18 @@ CHECK_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --repo) REPO="$2"; shift 2 ;;
+        --revision) REVISION="$2"; shift 2 ;;
         --dest) DEST="$2"; shift 2 ;;
         --jobs) JOBS="$2"; shift 2 ;;
         --dry-run) DRY=1; shift ;;
         --check) CHECK_ONLY=1; shift ;;
-        -h|--help) sed -n '4,27p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,36p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-API="https://huggingface.co/api/models/${REPO}"
-RAW="https://huggingface.co/${REPO}/resolve/main"
+API="https://huggingface.co/api/models/${REPO}/revision/${REVISION}"
+RAW="https://huggingface.co/${REPO}/resolve/${REVISION}"
 STATE="$DEST/.download-state"
 LOG="$DEST/download.log"
 
@@ -109,6 +118,7 @@ hcurl() {
 }
 
 echo "repo:  $REPO"
+echo "rev:   $REVISION"
 echo "dest:  $DEST"
 
 code=$(hcurl -s -o /dev/null -w '%{http_code}' --max-time 30 "$API")
@@ -279,7 +289,9 @@ PY
 TOTAL=$(wc -l < "$DEST/.shards" | tr -d ' ')
 TOTAL_BYTES=$("$PY" - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r'
 import json, sys
-print(json.load(open(sys.argv[1])).get("metadata", {}).get("total_size", 0))
+# Qwen stores total_size as a JSON float (359999963128.0). bash $(( ))
+# cannot parse the trailing .0, so this must be a bare integer.
+print(int(json.load(open(sys.argv[1])).get("metadata", {}).get("total_size", 0) or 0))
 PY
 )
 

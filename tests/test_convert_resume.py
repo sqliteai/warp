@@ -275,6 +275,38 @@ def main():
         ck(did == [], f"converts nothing {did}")
         ck(books(out) == before, "and leaves codebooks.bin byte-identical")
 
+        print("resume after merge, before the manifest (PLE interrupt)")
+        # Merge deletes the per-layer parts. Without a manifest the old
+        # recovery required those parts, so it rewrote every bank and
+        # assigned bases past the merged file.
+        out = os.path.join(tmp, "postmerge.waste")
+        run(out, src)
+        os.remove(os.path.join(out, "manifest.json"))
+        before = books(out)
+        did = run(out, src)
+        ck(did == [], f"merged banks stay cached with no manifest {did}")
+        ck(books(out) == before, "and codebooks.bin is unchanged")
+        ok, why = check_consistency(out, MOE_LAYERS)
+        ck(ok, f"each bank still indexes its own records ({why})")
+
+        print("resume after merge with two banks gone (hole refill)")
+        out = os.path.join(tmp, "postmerge-holes.waste")
+        run(out, src)
+        os.remove(os.path.join(out, "manifest.json"))
+        os.remove(os.path.join(out, "experts-L1.bin"))
+        os.remove(os.path.join(out, "experts-L2.bin"))
+        did = run(out, src)
+        ck(did == [1, 2], f"re-converts only the missing banks {did}")
+        ck(CONV.bank_codebook_base(os.path.join(out, "experts-L1.bin")) == 0,
+           "L1 reuses hole base 0, not the merged record count")
+        ck(CONV.bank_codebook_base(os.path.join(out, "experts-L2.bin"))
+           == PER_LAYER,
+           "L2 reuses hole base 9")
+        ok, why = check_consistency(out, MOE_LAYERS)
+        ck(ok, f"refilled banks keep original bases ({why})")
+        ck(books(out) == list(range(len(MOE_LAYERS) * PER_LAYER)),
+           "merged codebooks stay dense, no appended copies")
+
         print("resume with a different --layers, the case that used to renumber")
         out = os.path.join(tmp, "subset.waste")
         os.makedirs(out)
