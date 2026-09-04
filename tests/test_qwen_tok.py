@@ -33,8 +33,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import hf_tokenizer as HFT  # noqa: E402
 
-PINNED = os.environ.get("WASTE_QWEN_SRC",
-                        "/Users/admin/mnt/llm/qwen38-flash-next/raw")
+# Set WASTE_QWEN_SRC to the pinned checkpoint directory. Without it the
+# parity half skips; the pattern half above it needs no weights at all.
+PINNED = os.environ.get("WASTE_QWEN_SRC", "")
 
 # What Qwen3.8-Flash-Next's tokenizer.json states, verbatim.
 QWEN_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?"
@@ -130,8 +131,9 @@ def main():
         digit_run_changes_pieces()
 
     if not os.path.isfile(os.path.join(PINNED, "tokenizer.json")):
-        print(f"SKIP the parity half: no tokenizer.json under {PINNED} "
-              f"(set WASTE_QWEN_SRC)")
+        print("SKIP the parity half: set WASTE_QWEN_SRC to the pinned "
+              "checkpoint directory" if not PINNED else
+              f"SKIP the parity half: no tokenizer.json under {PINNED}")
         return 77 if not fails else 1
     if not os.path.exists(os.path.join(ROOT, "test_tokenizer")):
         print("SKIP the parity half: test_tokenizer is not built (make test)")

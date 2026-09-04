@@ -141,6 +141,95 @@ GLM = {
     "index_kpool_always_select_tail": True,
 }
 
+# --qwen writes a text-only Qwen3.8-Flash-Next fixture at the same scale.
+# Shapes match official qwen4_exp: GDN qkv = 2*Hk*Dk+Hv*Dv, QSA o_proj is
+# hid x n_heads*head_dim, indexer is (n+kv)*idx_dim, 16 PLE heads.
+H_GDN, D_GDN = 4, 8
+QWEN_CFG = {
+    "model_type": "qwen4_exp_text",
+    "architectures": ["Qwen4ExpForConditionalGeneration"],
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "moe_intermediate_size": 16,
+    "shared_expert_intermediate_size": 16,
+    "num_experts": 4,
+    "num_experts_per_token": 2,
+    "num_experts_per_tok": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "rms_norm_eps": 1e-6,
+    "vocab_size": 256,
+    "tie_word_embeddings": False,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_act": "silu",
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": D_GDN,
+    "linear_num_value_heads": 12,
+    "linear_value_head_dim": D_GDN,
+    "linear_conv_kernel_dim": 4,
+    "hc_count": 4,
+    "hc_lowrank": 8,
+    "ple_embed_dim": 128,
+    "ple_layer_ids": [2],
+    "ple_conv_kernel_size": 4,
+    "ngram_size": 3,
+    "ngram_vocab_size_base": 64,
+    "split_ngram_parts": 8,
+    "heads_per_ngram": 8,
+    "indexer_n_heads": 2,
+    "indexer_kv_heads": 1,
+    "indexer_head_dim": 8,
+    "indexer_budget": 32,
+    "indexer_compress_ratio": 4,
+    "partial_rotary_factor": 0.5,
+    "rope_parameters": {
+        "partial_rotary_factor": 0.5,
+        "rope_theta": 10000.0,
+        "mrope_section": [2, 2, 2],
+        "rope_type": "default",
+        "mrope_interleaved": True,
+    },
+    "ple_head_offsets": [0] * 16,
+    "ple_head_vocab_sizes": [32] * 16,
+    "ple_layer_multipliers": [3, 5, 7],
+}
+PLE_HEADS, PLE_HEAD_WIDTH = 16, 8
+
+def _is_prime(n):
+    if n < 2:
+        return False
+    if n % 2 == 0:
+        return n == 2
+    d = 3
+    while d * d <= n:
+        if n % d == 0:
+            return False
+        d += 2
+    return True
+
+
+def _nth_prime_after(start, count):
+    p = start
+    for _ in range(count):
+        p += 1
+        while not _is_prime(p):
+            p += 1
+    return p
+
+
+QWEN_PLE_SIZES = [_nth_prime_after(10, h + 1) for h in range(PLE_HEADS)]
+QWEN_PLE_MULT = [3, 5, 7]
+QWEN_CFG["ple_head_vocab_sizes"] = QWEN_PLE_SIZES
+_off, _offsets = 0, []
+for _s in QWEN_PLE_SIZES:
+    _offsets.append(_off)
+    _off += _s
+QWEN_CFG["ple_head_offsets"] = _offsets
+QWEN_CFG["ple_layer_multipliers"] = QWEN_PLE_MULT
+
 # --rope turns the above into a DeepSeek-V3 at the same scale, which is the
 # only shape that reaches src/model.c's rotary: the Kimi models set
 # mla_use_nope and pass the qk_rope dims through unrotated, so a container
@@ -361,6 +450,118 @@ def write_tokenizer(outdir):
     return base + len(SPECIALS)
 
 
+def write_qwen_container(args, rng):
+    """A structurally valid Qwen text fixture. Format v0, WEXP unchanged."""
+    cfg = dict(QWEN_CFG)
+    hid = cfg["hidden_size"]
+    moe = cfg["moe_intermediate_size"]
+    hc, lr = cfg["hc_count"], cfg["hc_lowrank"]
+    hc_w = hc * hid
+    t = Trunk(rng, "")
+    t.quant("model.embed_tokens.weight", [cfg["vocab_size"], hid])
+    t.f32("model.hyper_connection_mixer.hc_norm.weight", [hc_w])
+    t.quant("model.hyper_connection_mixer.input_mix_weight_down.weight", [lr, hc_w])
+    t.quant("model.hyper_connection_mixer.input_mix_weight_up.weight", [hc_w, lr])
+    for L, kind in enumerate(cfg["layer_types"]):
+        p = f"model.layers.{L}."
+        for side in ("attn_hyper_connection", "mlp_hyper_connection"):
+            t.f32(p + side + ".hc_norm.weight", [hc_w])
+            t.quant(p + side + ".block_inject_weight.weight", [hc, hc_w])
+            t.quant(p + side + ".input_mix_weight_down.weight", [lr, hc_w])
+            t.quant(p + side + ".input_mix_weight_up.weight", [hc_w, lr])
+        if kind == "linear_attention":
+            a = p + "linear_attn."
+            hk, hv = cfg["linear_num_key_heads"], cfg["linear_num_value_heads"]
+            dk, dv = cfg["linear_key_head_dim"], cfg["linear_value_head_dim"]
+            qkv = 2 * hk * dk + hv * dv
+            t.f32(a + "A_log", [hv])
+            t.f32(a + "dt_bias", [hv])
+            t.f32(a + "conv1d.weight", [qkv, 1, cfg["linear_conv_kernel_dim"]])
+            t.quant(a + "in_proj_qkv.weight", [qkv, hid])
+            t.quant(a + "in_proj_z.weight", [hv * dv, hid])
+            t.quant(a + "in_proj_a.weight", [hv, hid])
+            t.quant(a + "in_proj_b.weight", [hv, hid])
+            t.f32(a + "norm.weight", [dv])
+            t.quant(a + "out_proj.weight", [hid, hv * dv])
+        else:
+            a = p + "self_attn."
+            qd = cfg["num_attention_heads"] * cfg["head_dim"]
+            kvd = cfg["num_key_value_heads"] * cfg["head_dim"]
+            idxd = ((cfg["indexer_n_heads"] + cfg["indexer_kv_heads"])
+                    * cfg["indexer_head_dim"])
+            t.quant(a + "q_proj.weight", [qd * 2, hid])
+            t.quant(a + "k_proj.weight", [kvd, hid])
+            t.quant(a + "v_proj.weight", [kvd, hid])
+            t.quant(a + "o_proj.weight", [hid, qd])
+            t.f32(a + "q_norm.weight", [cfg["head_dim"]])
+            t.f32(a + "k_norm.weight", [cfg["head_dim"]])
+            t.quant(a + "indexer.index_qk_proj.weight", [idxd, hid])
+            t.f32(a + "indexer.q_layernorm.weight", [cfg["indexer_head_dim"]])
+            t.f32(a + "indexer.k_layernorm.weight", [cfg["indexer_head_dim"]])
+        m = p + "mlp."
+        t.quant(m + "gate.weight", [cfg["num_experts"], hid])
+        t.quant(m + "shared_expert.gate_proj.weight", [moe, hid])
+        t.quant(m + "shared_expert.up_proj.weight", [moe, hid])
+        t.quant(m + "shared_expert.down_proj.weight", [hid, moe])
+        t.quant(m + "shared_expert_gate.weight", [1, hid])
+        if L == 1:
+            pe = cfg["ple_embed_dim"]
+            t.quant(p + "ple.key_proj.weight", [hc_w, pe])
+            t.quant(p + "ple.value_proj.weight", [hid, pe])
+            t.f32(p + "ple.conv1d.weight", [hc_w, 1, cfg["ple_conv_kernel_size"]])
+            t.f32(p + "ple.norm_conv.weight", [hc_w])
+            t.f32(p + "ple.norm_key.weight", [hc_w])
+            t.f32(p + "ple.norm_query.weight", [hc_w])
+            ngram_heads = (cfg["ngram_size"] - 1) * cfg["heads_per_ngram"]
+            head_w = pe // ngram_heads
+            for h in range(PLE_HEADS):
+                t.quant(p + f"ple.ple_embedding.ngram_head.{h}.weight",
+                        [QWEN_PLE_SIZES[h], head_w], bits=8)
+    t.quant("lm_head.weight", [cfg["vocab_size"], hid])
+    with open(os.path.join(args.out, "trunk.bin"), "wb") as f:
+        f.write(t.buf)
+
+    shapes = [(moe, hid), (moe, hid), (hid, moe)]
+    layers, cb_base = {}, 0
+    with open(os.path.join(args.out, "codebooks.bin"), "wb") as cf:
+        for L in range(cfg["num_hidden_layers"]):
+            for ki in range(len(KINDS)):
+                for si in range(STAGES):
+                    cid = cb_base + ki * STAGES + si
+                    cf.write(struct.pack("<IHBBII", MAGIC_CODEBOOK,
+                                         cid & 0xFFFF, FMT_VQ3R, VEC_DIM,
+                                         CB_ENTRIES, 0))
+                    cf.write(f16([rng.uniform(-0.3, 0.3)
+                                  for _ in range(CB_ENTRIES * VEC_DIM)]))
+            name = f"experts-L{L}.bin"
+            with open(os.path.join(args.out, name), "wb") as bf:
+                total = sum(write_expert(bf, L, e, cb_base, shapes, rng)
+                            for e in range(cfg["num_experts"]))
+            layers[str(L)] = {"file": name, "experts": cfg["num_experts"],
+                              "bytes": total, "codebook_base": cb_base}
+            cb_base += len(KINDS) * STAGES
+
+    manifest = {
+        "format_version": 0,
+        "arch": "qwen4_exp_text",
+        "tensor_prefix": "",
+        "config": cfg,
+        "expert_quant": {"fmt": "VQ3R", "stages": STAGES, "vec_dim": VEC_DIM,
+                         "entries": CB_ENTRIES, "index_block": IDX_BLOCK,
+                         "bits_per_weight": STAGES},
+        "layers": layers,
+        "trunk": t.index,
+    }
+    with open(os.path.join(args.out, "manifest.json"), "w",
+              newline="\n") as f:
+        json.dump(manifest, f, indent=1)
+    total = sum(os.path.getsize(os.path.join(args.out, f))
+                for f in os.listdir(args.out))
+    print(f"wrote {args.out}: qwen4_exp_text, {cfg['num_hidden_layers']} layers, "
+          f"{cfg['num_experts']} experts, {total / (1 << 20):.1f} MB")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -422,6 +623,9 @@ def main():
                     help="override rope_scaling.mscale, leaving mscale_all_dim "
                          "at 1.0. Unequal mscales put a ratio on cos/sin that "
                          "the engine does not apply, so it refuses instead")
+    ap.add_argument("--qwen", action="store_true",
+                    help="a tiny Qwen3.8-Flash-Next text fixture: packed-MoE "
+                         "WEXP banks, GDN/QSA/HC names, 16 on-disk PLE heads")
     args = ap.parse_args()
     if args.index_bits == 6:
         # The engine validates index_bits 6 only as 4 stages of 64 entries
@@ -432,6 +636,9 @@ def main():
         STAGES, CB_ENTRIES, PACKED, INDEX_BITS = 4, 64, True, 6
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
+
+    if args.qwen:
+        return write_qwen_container(args, rng)
 
     cfg = dict(CFG)
     if args.glm:

@@ -30,6 +30,7 @@ import argparse
 import glob
 import importlib.util
 import json
+import mmap
 import os
 import struct
 import sys
@@ -112,46 +113,129 @@ class Container:
         2 GB trunk, impossible for K3's 31 GB (it would want ~124 GB). The
         blob stays as read and each tensor is materialized the first time
         it is asked for, with a bounded cache of the big ones."""
-        self._blob = open(os.path.join(self.path, "trunk.bin"), "rb").read()
+        trunk_path = os.path.join(self.path, "trunk.bin")
+        self._trunk_f = open(trunk_path, "rb")
+        # mmap, not read(): a Qwen trunk is tens of GiB and must not be
+        # copied into the oracle process just to reach one row at a time.
+        self._blob = mmap.mmap(self._trunk_f.fileno(), 0, access=mmap.ACCESS_READ)
         self._meta = {e["name"]: e for e in self.man["trunk"]}
         self.t = _LazyTrunk(self)
+
+    def _deq_row(self, name, row, cols=None):
+        """One trunk row as f32 — matches waste_deq_row."""
+        e = self._meta[name]
+        shape, off = e["shape"], e["off"]
+        N = shape[-1] if cols is None else cols
+        blob = self._blob
+        if e["fmt"] == 0:
+            base = off + row * N * 4
+            return torch.frombuffer(bytearray(blob[base:base + N * 4]),
+                                    dtype=torch.float32).clone()
+        g = e["group"]
+        ng = (N + g - 1) // g
+        fmt, rowbytes = e["fmt"], None
+        if fmt == 3:
+            rowbytes = ng * g // 2
+        elif fmt == 7:
+            rowbytes = (ng * g * 3 + 7) // 8 + 1
+        else:
+            rowbytes = ng * g
+        qoff = off + row * rowbytes
+        soff = e["scale_off"] + row * ng * 2
+        if fmt == 3:
+            p4 = torch.frombuffer(bytearray(blob[qoff:qoff + rowbytes]),
+                                  dtype=torch.uint8)
+            sc = torch.frombuffer(bytearray(blob[soff:soff + ng * 2]),
+                                  dtype=torch.float16).view(ng).float()
+            idx = torch.arange(N)
+            k = idx // g
+            byte = p4[idx // 2]
+            v = torch.where((idx & 1) == 0, byte & 0x0F, byte >> 4).float() - 8.0
+            return (v * sc[k]).float()
+        elif fmt == 2:
+            q = torch.frombuffer(bytearray(blob[qoff:qoff + rowbytes]),
+                                 dtype=torch.int8).view(ng, g)
+            sc = torch.frombuffer(bytearray(blob[soff:soff + ng * 2]),
+                                  dtype=torch.float16).view(ng).float()
+            return (q.float() * sc.unsqueeze(-1)).reshape(-1)[:N].float()
+        else:
+            raise ValueError(f"unsupported trunk fmt {fmt} for row dequant")
+
+    def matvec(self, name, x, batch=1024):
+        """y = W @ x for 2-D trunk weight W [rows, cols]. Never materializes W."""
+        e = self._meta[name]
+        rows = 1
+        for s in e["shape"][:-1]:
+            rows *= s
+        cols = e["shape"][-1]
+        x = x.detach().float().cpu().reshape(-1)
+        y = torch.empty(rows, dtype=torch.float32)
+        for r0 in range(0, rows, batch):
+            r1 = min(r0 + batch, rows)
+            w = torch.stack([self._deq_row(name, r, cols) for r in range(r0, r1)])
+            y[r0:r1] = w @ x
+        return y.to(self.dev)
+
+    def matvec_c(self, name, x):
+        """y = W @ x with C mv_rows / dotf summation order.
+
+        Matches the engine when WASTE_Q8=0 has dequantized the trunk to f32.
+        Torch batched @ can reorder sums enough to swap near-tie MoE routes."""
+        e = self._meta[name]
+        rows = 1
+        for s in e["shape"][:-1]:
+            rows *= s
+        cols = e["shape"][-1]
+        xv = x.detach().float().cpu().reshape(-1).tolist()
+        y = [0.0] * rows
+        for r in range(rows):
+            wr = self._deq_row(name, r, cols).tolist()
+            acc = 0.0
+            for i in range(cols):
+                acc += wr[i] * xv[i]
+            y[r] = acc
+        return torch.tensor(y, dtype=torch.float32).to(self.dev)
+
+    def embed_row(self, token):
+        name = f"{self.prefix}model.embed_tokens.weight"
+        return self._deq_row(name, int(token)).to(self.dev)
+
+    def table_row(self, name, row):
+        """One row from any trunk matrix (embed, PLE ngram tables, …)."""
+        return self._deq_row(name, int(row)).to(self.dev)
 
     def _materialize(self, name):
         e = self._meta[name]
         blob = self._blob
-        if True:
-            shape, off = e["shape"], e["off"]
-            if e["fmt"] == 0:                                  # F32
-                n = 1
-                for s in shape:
-                    n *= s
-                x = torch.frombuffer(bytearray(blob[off:off + n * 4]),
-                                     dtype=torch.float32).view(*shape)
-            else:                                              # Q8G / Q4G
-                rows = 1
-                for s in shape[:-1]:
-                    rows *= s
-                N, g = shape[-1], e["group"]
-                ng = (N + g - 1) // g
-                if e["fmt"] == 3:
-                    # Q4G: two signed nibbles per byte, low first, stored as
-                    # v+8 and packed per row. Most of K3's trunk is this, and
-                    # decoding it as int8 silently blows the hidden state up
-                    # by seven orders of magnitude.
-                    b = torch.frombuffer(
-                        bytearray(blob[off:off + rows * ng * g // 2]),
-                        dtype=torch.uint8).view(rows, ng * g // 2).int()
-                    q = torch.stack([b & 0x0F, b >> 4], -1)
-                    q = (q.view(rows, ng, g) - 8).float()
-                else:
-                    q = torch.frombuffer(bytearray(blob[off:off + rows * ng * g]),
-                                         dtype=torch.int8).view(rows, ng, g).float()
-                sc = torch.frombuffer(
-                    bytearray(blob[e["scale_off"]:e["scale_off"] + rows * ng * 2]),
-                    dtype=torch.float16).view(rows, ng, 1).float()
-                x = (q * sc).view(rows, ng * g)[:, :N].reshape(*shape)
-            return x.to(self.dev)
-        return None
+        shape, off = e["shape"], e["off"]
+        rows = 1
+        for s in shape[:-1]:
+            rows *= s
+        cols = shape[-1]
+        if e["fmt"] != 0 and rows * cols > 100_000_000:
+            raise MemoryError(
+                f"{name} is {rows}x{cols} quantized — use matvec() or embed_row()")
+        if e["fmt"] == 0:                                  # F32
+            n = rows * cols
+            x = torch.frombuffer(bytearray(blob[off:off + n * 4]),
+                                 dtype=torch.float32).view(*shape)
+        else:                                              # Q8G / Q4G
+            N, g = cols, e["group"]
+            ng = (N + g - 1) // g
+            if e["fmt"] == 3:
+                b = torch.frombuffer(
+                    bytearray(blob[off:off + rows * ng * g // 2]),
+                    dtype=torch.uint8).view(rows, ng * g // 2).int()
+                q = torch.stack([b & 0x0F, b >> 4], -1)
+                q = (q.view(rows, ng, g) - 8).float()
+            else:
+                q = torch.frombuffer(bytearray(blob[off:off + rows * ng * g]),
+                                     dtype=torch.int8).view(rows, ng, g).float()
+            sc = torch.frombuffer(
+                bytearray(blob[e["scale_off"]:e["scale_off"] + rows * ng * 2]),
+                dtype=torch.float16).view(rows, ng, 1).float()
+            x = (q * sc).view(rows, ng * g)[:, :N].reshape(*shape)
+        return x.to(self.dev)
 
     def expert(self, L, eid):
         """Dequantize one expert: exactly one pread of its 4 KiB-aligned record."""
