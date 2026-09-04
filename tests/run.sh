@@ -2052,7 +2052,12 @@ c = man["config"]
 
 hf = ((c.get("_outer", {}).get("architectures") or c.get("architectures")
        or [""]))[0]
+# The same mapping waste_model_get_info makes, because that is what is
+# being checked: a family the engine names and this rule does not would
+# fail here for spelling rather than for describing the wrong container.
 arch = ("kimi-k3" if "KimiK3" in hf else "kimi-linear" if "KimiLinear" in hf
+        else "glm5-next" if "Glm5Next" in hf
+        else "qwen4_exp_text" if "Qwen4Exp" in hf
         else hf or "unknown")     # a container that names nothing gets that
 
 NAMES = {0: "F32", 1: "F16", 2: "Q8G", 3: "Q4G", 7: "Q3G"}
@@ -2303,7 +2308,13 @@ fi
 
 # End to end on a tiny packed source: nested config in, container out, with
 # the vision tower and the MTP layer left behind and the 16 heads present.
-if ! command -v uv >/dev/null 2>&1; then
+if [ "${WASTE_SANITIZED:-0}" = 1 ]; then
+    # convert.py dlopens libwastevq for the encoder, and under a sanitized
+    # build ASan is not the first library a plain python3 loaded, so the
+    # run dies in the allocator instead of converting anything. Same cause
+    # as the serve suite's skip below.
+    sk "Qwen conversion round trip" "not run under the sanitizers"
+elif ! command -v uv >/dev/null 2>&1; then
     sk "Qwen conversion round trip" "uv not installed"
 else
     out=$(run_uv run --quiet --with torch --no-project \
