@@ -106,6 +106,7 @@ typedef struct {
      * branch. 1 on both Kimi models and the default; GLM's pattern has no
      * such branch and its containers say so. */
     int   tok_han_split;
+    int   tok_digit_run;    /* digits per pre-token: 3 (default) or 1     */
     /* generation_config.json's eos_token_id, mirrored into the container
      * config. The tokenizer used to derive this positionally as
      * base_vocab + 2, which is right on both Kimi models by luck of the

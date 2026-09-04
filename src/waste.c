@@ -795,6 +795,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     if (c->tok) {
         waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
         waste_tok_set_han_split(c->tok, c->m.cfg.tok_han_split);
+        waste_tok_set_digit_run(c->tok, c->m.cfg.tok_digit_run);
     }
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, c->usage);

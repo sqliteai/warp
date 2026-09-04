@@ -1826,20 +1826,25 @@ def main():
             copied_tok = True
             break
     # A release with no tiktoken rank file but a `tokenizers` tokenizer.json
-    # — GLM's shape. Re-encoded rather than copied, and refused rather than
-    # approximated when its pattern or its merge order is not the one
-    # src/tokenizer.c implements. See tools/hf_tokenizer.py.
+    # — GLM's shape, and Qwen's. Re-encoded rather than copied, and refused
+    # rather than approximated when its pattern or its merge order is not
+    # one src/tokenizer.c implements. See tools/hf_tokenizer.py.
     if not copied_tok and os.path.exists(os.path.join(args.src, "tokenizer.json")):
         import hf_tokenizer
-        text, han_split, tok_specials = hf_tokenizer.convert(args.src)
+        text, han_split, tok_specials, digit_run = hf_tokenizer.convert(args.src)
         atomic_text(os.path.join(args.out, "tokenizer.model"), text)
         # The engine defaults to the Kimi pattern, so only the other case is
         # written — and it is written, not inferred at load: the difference
-        # is one token on "A股" and shows up nowhere as an error.
+        # is one token on "A股" and shows up nowhere as an error. The same
+        # goes for the digit run: Qwen tokenizes "2026" as four pieces and
+        # Kimi as one, and neither can be guessed from the vocabulary.
         if not han_split:
             cfg["tokenizer_han_split"] = False
+        if digit_run != 3:
+            cfg["tokenizer_digit_run"] = digit_run
         print(f"tokenizer: re-encoded tokenizer.json"
-              f"{'' if han_split else ' (no Han branch in its pattern)'}")
+              f"{'' if han_split else ' (no Han branch in its pattern)'}"
+              f"{'' if digit_run == 3 else f', {digit_run} digit per piece'}")
 
     # ---- special tokens --------------------------------------------------
     # tiktoken's rank file holds only ordinary merges; the markup tokens live

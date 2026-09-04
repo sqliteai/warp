@@ -1563,6 +1563,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->index_dim   = (int)js_int(d, js_get(d, cfg, "index_head_dim"), 0);
     c->index_tail  = js_get(d, cfg, "index_kpool_always_select_tail") >= 0;
     c->tok_han_split = js_bool(d, js_get(d, cfg, "tokenizer_han_split"), 1);
+    c->tok_digit_run = (int)js_int(d, js_get(d, cfg, "tokenizer_digit_run"), 3);
 
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;

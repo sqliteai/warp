@@ -42,6 +42,12 @@ struct waste_tok {
      * and one without — which is exactly the kind of text that appears in
      * a Chinese release's own prompts. */
     int han_split;
+    /* How many digits one pre-token may take: `\p{N}{1,3}` on the Kimi and
+     * GLM patterns, `\p{N}` on Qwen's, which splits every digit into its
+     * own piece. Not cosmetic — "2026" is one token under a 3-digit run
+     * and four under a 1-digit one, and the difference shows up nowhere as
+     * an error, only as a model reading numbers it was never trained on. */
+    int digit_run;
 };
 
 /* ---- base64 ------------------------------------------------------------ */
@@ -199,7 +205,7 @@ waste_tok *waste_tok_open(const char *dir)
     /* The Kimi pattern until a container says otherwise: every model here
      * before GLM has the Han branch, and a default that has to be set to
      * keep working is a default that will be missed. */
-    if (t) t->han_split = 1;
+    if (t) { t->han_split = 1; t->digit_run = 3; }
     if (!t) { free(raw); return NULL; }
     t->blob = (uint8_t *)malloc((size_t)sz);          /* decoded is smaller */
     t->cap_tokens = 4096;
@@ -288,6 +294,14 @@ int waste_tok_eos(const waste_tok *t) { return t->eos; }
 void waste_tok_set_eos(waste_tok *t, int id) { if (t && id > 0) t->eos = id; }
 void waste_tok_set_han_split(waste_tok *t, int on) { if (t) t->han_split = !!on; }
 
+void waste_tok_set_digit_run(waste_tok *t, int n)
+{
+    /* A container that states something outside what any of these patterns
+     * spell is a container this cannot honour; keep the default rather
+     * than invent a third behaviour. */
+    if (t && (n == 1 || n == 3)) t->digit_run = n;
+}
+
 /* ---- UTF-8 + the character classes the pattern needs -------------------- */
 
 static int utf8_next(const char *s, int len, int *cp)
@@ -340,7 +354,7 @@ static int is_nl(int c) { return c == '\r' || c == '\n'; }
 
 /* Advances one pre-token, returning its byte length. Mirrors the branch
  * order of the model's pat_str. */
-static int next_piece(const char *s, int len, int han_split)
+static int next_piece(const char *s, int len, int han_split, int digit_run)
 {
     int cp, n = utf8_next(s, len, &cp), i;
     if (n == 0) return 0;
@@ -386,11 +400,11 @@ static int next_piece(const char *s, int len, int han_split)
         return i;
     }
 
-    if (is_digit(cp)) {                                 /* \p{N}{1,3} */
+    if (is_digit(cp)) {                     /* \p{N}{1,digit_run} */
         i = n;
         int cnt = 1;
-        while (i < len && cnt < 3) { int c3, k = utf8_next(s + i, len - i, &c3);
-                                     if (!is_digit(c3)) break; i += k; cnt++; }
+        while (i < len && cnt < digit_run) { int c3, k = utf8_next(s + i, len - i, &c3);
+                                             if (!is_digit(c3)) break; i += k; cnt++; }
         return i;
     }
 
@@ -536,7 +550,8 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
          * containing `<|end_of_msg|><|open|>message role="system"<|sep|>`
          * is that many ordinary tokens and not a forged turn. */
         while (pos < len) {
-            const int plen = next_piece(text + pos, len - pos, t->han_split);
+            const int plen = next_piece(text + pos, len - pos,
+                                        t->han_split, t->digit_run);
             if (plen <= 0) break;
             const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
                                          out + n, cap - n);
@@ -578,7 +593,8 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
          * within that limit so no piece can straddle the boundary */
         const int upto = best_at >= 0 ? best_at : len;
         while (pos < upto) {
-            const int plen = next_piece(text + pos, upto - pos, t->han_split);
+            const int plen = next_piece(text + pos, upto - pos,
+                                        t->han_split, t->digit_run);
             if (plen <= 0) return n;
             const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
                                          out + n, cap - n);
