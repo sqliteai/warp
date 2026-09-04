@@ -1590,6 +1590,204 @@ PYD
     fi
 fi
 
+head_ "Qwen3.8-Flash-Next (GDN, QSA, HyperConnection, PLE)"
+
+# A Qwen container is not a Kimi container with different numbers: the
+# recurrence is Gated DeltaNet rather than KDA, attention is sparse over
+# the original K/V rather than over a latent, the residual is four streams,
+# and one layer reads an n-gram embedding a row at a time off the trunk.
+# None of that is reachable from any other fixture, so this builds its own
+# — a few hundred kilobytes, seed-deterministic, format v0 with unchanged
+# WEXP records.
+QWENC="$TMP/qwen.waste"
+if ! python3 tools/make_test_container.py --qwen "$QWENC" >/dev/null 2>&1; then
+    sk "Qwen checks" "make_test_container.py --qwen did not build a container"
+else
+    # Format first: a fixture that quietly stopped being a real container
+    # would make every check below vacuous.
+    qman=$(python3 -c "import json;m=json.load(open('$QWENC/manifest.json'));print(m['format_version'], m['arch'])" 2>/dev/null)
+    qmagic=$(python3 -c "import struct;print(struct.unpack('<I', open('$QWENC/experts-L0.bin','rb').read(4))[0] == 0x50584557)" 2>/dev/null)
+    qinfo=$(./waste info "$QWENC" 2>&1)
+    ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_seq.bin" 0 >"$TMP/qwen_fwd.log" 2>&1
+    if [ "$qman" = "0 qwen4_exp_text" ] && [ "$qmagic" = "True" ] &&
+       printf '%s' "$qinfo" | grep -q "qwen4_exp_text" &&
+       [ -s "$TMP/qwen_seq.bin" ]; then
+        ok "the Qwen fixture is format v0 with WEXP records and loads as qwen4_exp_text"
+    else
+        no "the Qwen fixture did not load (manifest='$qman' wexp=$qmagic)"
+        printf '%s\n' "$qinfo" | tail -5
+    fi
+
+    # QSA pools four keys into a block. Three tokens leave the block open
+    # and only the tail; the fourth closes it. Reported by test_forward so
+    # the boundary is observable rather than inferred from the logits.
+    q3=$(./test_forward "$QWENC" 3,7,11 /dev/null 0 2>&1 | grep '^qsa_layer')
+    q4=$(./test_forward "$QWENC" 3,7,11,5 /dev/null 0 2>&1 | grep '^qsa_layer')
+    if printf '%s' "$q3" | grep -q 'blk 0 tail 3' &&
+       printf '%s' "$q4" | grep -q 'blk 1 tail 0'; then
+        ok "QSA closes a 4-token block on the fourth token"
+    else
+        no "QSA block pooling is wrong (3 tok: '$q3'; 4 tok: '$q4')"
+    fi
+
+    # Chunked prefill against sequential decode, the check that has caught
+    # every state bug in this engine: the two share no code above the layer
+    # loop and must agree bit for bit.
+    WASTE_CHUNK=1 ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_chunk.bin" 0 \
+        >/dev/null 2>&1
+    if [ ! -s "$TMP/qwen_chunk.bin" ]; then
+        no "chunked prefill did not run on a Qwen container"
+    elif cmp -s "$TMP/qwen_seq.bin" "$TMP/qwen_chunk.bin"; then
+        ok "chunked prefill is bit-identical to sequential decode"
+    else
+        no "Qwen chunked prefill disagrees with sequential decode"
+    fi
+
+    # The hyper-state dump is what the container-native oracle diffs
+    # against, so its shape is checked on its own: a dump of the wrong
+    # length would make that comparison read the wrong layer.
+    if [ -n "$PY_MISS" ]; then
+        sk "Qwen hyper-state dump" "$PY_MISS"
+    elif python3 tests/test_qwen_dump.py >/dev/null 2>&1; then
+        ok "WASTE_DUMP_HIDDEN writes all four residual streams after every layer"
+    else
+        no "WASTE_DUMP_HIDDEN is missing or the wrong size on a Qwen container"
+    fi
+
+    # A budget under the floor is refused rather than swapped into, and the
+    # floor is computed from Qwen's own state keys — GDN's S, the conv
+    # rings, the BF16 K/V and the raw index keys.
+    qsmall=$(./waste run "$QWENC" x --budget 1 2>&1 || true)
+    qhuge=$(./waste run "$QWENC" x --ctx 8000000 --budget 8M 2>&1 || true)
+    if printf '%s' "$qsmall" | grep -qi "budget" &&
+       printf '%s' "$qhuge" | grep -qi "budget"; then
+        ok "a RAM budget under the Qwen floor is refused, not swapped into"
+    else
+        no "an under-floor Qwen budget was accepted"
+    fi
+
+    # top_k comes from the normalised key, and from HF's spelling when a
+    # container was written without it: planning for 0 experts would
+    # under-size the scratch that many pointers are cut from.
+    if [ -n "$PY_MISS" ]; then
+        sk "Qwen top_k alias" "$PY_MISS"
+    else
+        cp -R "$QWENC" "$TMP/qwen-alias.waste"
+        python3 - "$TMP/qwen-alias.waste" <<'PYQ'
+import json, sys
+p = sys.argv[1] + "/manifest.json"
+m = json.load(open(p))
+m["config"].pop("num_experts_per_token", None)   # leave only HF's spelling
+json.dump(m, open(p, "w"), indent=1)
+PYQ
+        if [ "$(./waste plan "$QWENC" --json)" = \
+             "$(./waste plan "$TMP/qwen-alias.waste" --json)" ]; then
+            ok "plan reads top_k from num_experts_per_tok when the canonical key is absent"
+        else
+            no "Qwen plan disagrees with itself over the top_k alias"
+        fi
+    fi
+
+    # Refusals. Each of these is a container the engine could open and read
+    # wrongly rather than fail on, which is the whole reason cfg_sane
+    # bounds them: an out-of-range n-gram overruns a fixed context array, a
+    # second indexer KV head is a shape nothing here implements, and a
+    # missing layer_types reads as "every layer is GDN" — plausible,
+    # answer-changing, and invisible.
+    qwen_refused() {                  # <what> <python-edit>
+        local what="$1" edit="$2" dir="$TMP/qwen-bad.waste"
+        rm -rf "$dir"; cp -R "$QWENC" "$dir"
+        python3 -c "$edit" "$dir" || { no "$what (fixture edit failed)"; return; }
+        if ./waste info "$dir" >/dev/null 2>&1; then
+            no "$what was accepted"
+        else
+            ok "$what is refused"
+        fi
+    }
+    if [ -n "$PY_MISS" ]; then
+        sk "Qwen container refusals" "$PY_MISS"
+    else
+        qwen_refused "an n-gram order past the engine's fixed context" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ngram_size"]=99;json.dump(m,open(p,"w"))'
+        qwen_refused "an indexer with more than one KV head" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["indexer_kv_heads"]=2;json.dump(m,open(p,"w"))'
+        qwen_refused "a container that does not say which layers are attention" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"].pop("layer_types");json.dump(m,open(p,"w"))'
+        qwen_refused "a layer_types shorter than num_hidden_layers" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["layer_types"]=m["config"]["layer_types"][:1];json.dump(m,open(p,"w"))'
+    fi
+
+    # The isolated ops against an independent PyTorch reference written
+    # from the published equations, at the official geometry as well as at
+    # toy sizes.
+    if ! command -v uv >/dev/null 2>&1; then
+        sk "Qwen components" "uv not installed"
+    elif ./test_qwenparts "$TMP/qwenparts.bin" >/dev/null 2>&1 &&
+         run_uv run --quiet --with torch --no-project python \
+             tools/qwenparts_ref.py "$TMP/qwenparts.bin" 2>/dev/null |
+             grep -q "^PASS"; then
+        ok "PLE hashing, HyperConnection, GDN, QSA and the top-k router match the reference"
+    else
+        no "a Qwen component diverges from tools/qwenparts_ref.py"
+    fi
+
+    # The container-native oracle: the same container read by a PyTorch
+    # implementation of the same forward pass. Routes must match exactly
+    # and the argmax must match; the residual is gated at what this fixture
+    # measures, see docs/QWEN.md.
+    if ! command -v uv >/dev/null 2>&1; then
+        sk "container-native Qwen oracle" "uv not installed"
+    else
+        qout=$(run_uv run --quiet --with torch --no-project python \
+                   tests/test_qwen_container_ref.py 2>&1); qrc=$?
+        case "$qrc" in
+        0)   ok "the engine matches the container-native oracle (routes exact, argmax equal)" ;;
+        77)  sk "container-native Qwen oracle" "torch not installed" ;;
+        124) sk "container-native Qwen oracle" "uv timed out" ;;
+        *)   no "the engine diverges from the container-native Qwen oracle"
+             printf '%s\n' "$qout" | tail -12 ;;
+        esac
+    fi
+
+    # The oracle's own gates, tested against synthetic disagreements: a
+    # comparison that cannot fail proves nothing about the runs it passes.
+    if [ -n "$PY_MISS" ]; then
+        sk "Qwen route near-tie gate" "$PY_MISS"
+    elif python3 tests/test_qwen_compare_oracle.py >/dev/null 2>&1; then
+        ok "the route comparison rejects a real reorder and accepts only a near tie"
+    else
+        no "the Qwen route near-tie gate does not reject a wrong expert"
+    fi
+
+    if [ -n "$PY_MISS" ]; then
+        sk "Qwen streaming oracle" "$PY_MISS"
+    elif python3 tests/test_qwen_oracle.py >/dev/null 2>&1; then
+        ok "the official-weights oracle streams experts and n-gram rows rather than holding them"
+    else
+        no "tools/qwen_ref.py would materialize what it is meant to stream"
+    fi
+fi
+
+# The tokenizer half that needs no weights always runs; the parity half
+# needs the pinned checkpoint and the `tokenizers` package and says so.
+if [ -n "$PY_MISS" ]; then
+    sk "Qwen tokenizer" "$PY_MISS"
+else
+    if command -v uv >/dev/null 2>&1; then
+        qtok=$(run_uv run --quiet --with tokenizers --no-project python \
+                   tests/test_qwen_tok.py 2>&1); qtrc=$?
+    else
+        qtok=$(python3 tests/test_qwen_tok.py 2>&1); qtrc=$?
+    fi
+    case "$qtrc" in
+    0)   ok "the C tokenizer matches the pinned Qwen release, numbers included" ;;
+    77)  sk "Qwen tokenizer parity" "no pinned checkpoint (WASTE_QWEN_SRC) or no tokenizers package" ;;
+    124) sk "Qwen tokenizer parity" "uv timed out" ;;
+    *)   no "Qwen tokenizer parity"
+         printf '%s\n' "$qtok" | tail -12 ;;
+    esac
+fi
+
 head_ "RAM budget"
 
 # The default budget is the one path check_budget.sh cannot reach, because
@@ -1854,7 +2052,12 @@ c = man["config"]
 
 hf = ((c.get("_outer", {}).get("architectures") or c.get("architectures")
        or [""]))[0]
+# The same mapping waste_model_get_info makes, because that is what is
+# being checked: a family the engine names and this rule does not would
+# fail here for spelling rather than for describing the wrong container.
 arch = ("kimi-k3" if "KimiK3" in hf else "kimi-linear" if "KimiLinear" in hf
+        else "glm5-next" if "Glm5Next" in hf
+        else "qwen4_exp_text" if "Qwen4Exp" in hf
         else hf or "unknown")     # a container that names nothing gets that
 
 NAMES = {0: "F32", 1: "F16", 2: "Q8G", 3: "Q4G", 7: "Q3G"}
@@ -2071,6 +2274,57 @@ elif out=$(python3 tests/test_convert_glm.py 2>&1); then
 else
     no "convert.py GLM config"
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# Qwen nests its text model, packs 512 experts per layer into two tensors,
+# and keeps its n-gram tables in 128 shards that become 16 heads. Every one
+# of those is a shape no other member of this family has, and all three are
+# checked without torch and without a 360 GB conversion.
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py Qwen config" "$PY_MISS"
+elif out=$(python3 tests/test_convert_qwen.py 2>&1); then
+    ok "Qwen's nesting, packed expert layout, PLE consumers and reclaim classes"
+else
+    no "convert.py Qwen config"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# The PLE write is the one conversion step that cannot be done the obvious
+# way: a head is ~12 GiB as f32, so it is quantized in row batches and the
+# batches have to reconstruct exactly what quantizing the whole head would
+# have given.
+if ! command -v uv >/dev/null 2>&1; then
+    sk "Qwen PLE streaming write" "uv not installed"
+else
+    out=$(run_uv run --quiet --with torch --no-project \
+              python tests/test_qwen_ple_write.py 2>&1); rc=$?
+    case "$rc" in
+        0)   ok "PLE heads are written in Q8G row batches, not built whole in RAM" ;;
+        77)  sk "Qwen PLE streaming write" "torch not installed" ;;
+        124) sk "Qwen PLE streaming write" "uv timed out" ;;
+        *)   no "Qwen PLE streaming write"; printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5 ;;
+    esac
+fi
+
+# End to end on a tiny packed source: nested config in, container out, with
+# the vision tower and the MTP layer left behind and the 16 heads present.
+if [ "${WASTE_SANITIZED:-0}" = 1 ]; then
+    # convert.py dlopens libwastevq for the encoder, and under a sanitized
+    # build ASan is not the first library a plain python3 loaded, so the
+    # run dies in the allocator instead of converting anything. Same cause
+    # as the serve suite's skip below.
+    sk "Qwen conversion round trip" "not run under the sanitizers"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "Qwen conversion round trip" "uv not installed"
+else
+    out=$(run_uv run --quiet --with torch --no-project \
+              python tests/test_qwen_roundtrip.py 2>&1); rc=$?
+    case "$rc" in
+        0)   ok "a packed Qwen source converts to a container the engine's rules accept" ;;
+        77)  sk "Qwen conversion round trip" "torch not installed" ;;
+        124) sk "Qwen conversion round trip" "uv timed out" ;;
+        *)   no "Qwen conversion round trip"; printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback|assert" | head -5 ;;
+    esac
 fi
 
 # The chat.json the converter installs has to be the one whose markup the

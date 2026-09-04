@@ -15,7 +15,11 @@ stored once. Gate 3 measured this recipe on real Kimi experts.
 
 Reads a Kimi checkpoint as published — the 1.42 TB of moonshotai/Kimi-K3
 that tools/fetch_weights.sh leaves on the staging disk, or any other
-member of the family (Kimi-Linear) by pointing --src elsewhere.
+member of the family (Kimi-Linear) by pointing --src elsewhere. Qwen
+`qwen4_exp_text` is also accepted: nested `text_config` is flattened,
+packed `experts.gate_up_proj` / `down_proj` split into WEXP records, and
+128 PLE n-gram shards become 16 Q8G heads. `mtp.*` and `model.visual.*`
+are skipped. Format v0 and the WEXP record do not change.
 
   uv run --with torch python tools/convert.py \
       --src /path/to/hf-checkpoint \
@@ -42,6 +46,7 @@ the runs after.
 """
 
 import argparse
+import gc
 import io
 import json
 import os
@@ -170,6 +175,180 @@ CONFIG_ALIASES = (
 # renormalisation on for a checkpoint that sets it false. Emit only when true.
 CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
 
+# Qwen3.8-Flash-Next packs every routed expert of a layer into two tensors.
+# The shapes below are what the pinned release ships and are asserted by the
+# source-sample test; nothing in the converter branches on them. What the
+# conversion actually requires is the *layout* — gate_up [E, 2I, H] beside
+# down [E, H, I] — and that is checked by packed_shapes_ok, so a smaller
+# fixture or a larger family member converts on the same path.
+QWEN_TEXT_TYPE = "qwen4_exp_text"
+QWEN_PACKED_GATE_UP = (512, 1280, 2560)
+QWEN_PACKED_DOWN = (512, 2560, 640)
+PLE_HEADS = 16
+PLE_HEAD_WIDTH = 160
+
+
+def is_qwen(cfg):
+    """Qwen3.8-Flash-Next (`qwen4_exp`), by the name it gives itself.
+
+    The text model is `qwen4_exp_text` and it is what this converter reads;
+    the outer `qwen4_exp` wraps it beside a vision tower this container does
+    not carry. Either spelling identifies the family, because the flattened
+    config keeps the inner `model_type` and the raw one has only the outer."""
+    inner = cfg.get("text_config") or {}
+    for mt in (cfg.get("model_type"), inner.get("model_type")):
+        if mt in (QWEN_TEXT_TYPE, "qwen4_exp"):
+            return True
+    hf = ((cfg.get("_outer", {}).get("architectures")
+           or cfg.get("architectures") or [""]))[0]
+    return "Qwen4Exp" in hf
+
+
+def qwen_rename(name):
+    """Qwen wraps the text model the way GLM does, not the way K3 does.
+
+        Qwen  model.language_model.layers.N.…   lm_head.weight
+
+    So the container is prefix-less and the wrapper is dropped here, for the
+    reason spelled out in glm_rename: the engine's lookup is a fixed string
+    and a container that spells a tensor differently holds weights nothing
+    will ever ask for. The vision tower is not renamed because it is not
+    carried at all — see qwen_drop_trunk."""
+    pfx = "model.language_model."
+    if name.startswith(pfx):
+        return "model." + name[len(pfx):]
+    return name
+
+
+def qwen_drop_trunk():
+    """Which of Qwen's trunk tensors this container has no reader for.
+
+    Three groups. The MTP layer is a speculative-decoding head and the
+    vision tower is out of the text-only scope, so neither has a reader and
+    carrying either would cost resident RAM the expert cache wants. The PLE
+    n-gram shards *are* read, but not by build_trunk: 128 source shards
+    become 16 logical heads and build_ple writes them, streaming, after the
+    trunk pass — so they are dropped here and picked up there."""
+    def drop(name):
+        return bool(qwen_skip_tensor(name) or is_ple_ngram(name)
+                    or is_ple_meta(name))
+    return drop
+
+
+def qwen_skip_tensor(name):
+    """Vision and the MTP layer are out of the text-only milestone."""
+    return name.startswith("mtp.") or name.startswith("model.visual.")
+
+
+def is_ple_ngram(name):
+    return "ngram_embedding.shard_" in name and name.endswith(".weight")
+
+
+def is_ple_meta(name):
+    """I64 offset/size/multiplier tables. build_ple reads them after the trunk reclaim."""
+    return "ple_embedding." in name and name.endswith(
+        ("ngram_heads_offsets", "ngram_heads_vocab_sizes", "layer_multipliers"))
+
+
+def qwen_packed_names(src_pfx, layer):
+    """The two tensors that hold a whole layer's routed experts."""
+    p = f"{src_pfx}layers.{layer}.mlp.experts."
+    return p + "gate_up_proj", p + "down_proj"
+
+
+def split_packed_gate_up_shape(shape, inter):
+    """gate_up [E, 2I, H] splits into gate [E, I, H] and up [E, I, H]."""
+    e, two_i, h = shape
+    if two_i != 2 * inter:
+        raise ValueError(f"packed gate_up dim1 {two_i} is not 2*{inter}")
+    return (e, inter, h), (e, inter, h)
+
+
+def packed_shapes_ok(gate_up_shape, down_shape, n_exp):
+    """True when the packed pair matches n_exp experts of SwiGLU width."""
+    gs, ds = tuple(gate_up_shape), tuple(down_shape)
+    if len(gs) != 3 or len(ds) != 3:
+        return False
+    if gs[0] != n_exp or ds[0] != n_exp:
+        return False
+    if gs[1] % 2 or gs[1] // 2 != ds[2] or gs[2] != ds[1]:
+        return False
+    return True
+
+
+def ple_head_slices(offsets, vocab_sizes):
+    """(start, n_rows) for each logical PLE head."""
+    return [(int(offsets[i]), int(vocab_sizes[i])) for i in range(len(vocab_sizes))]
+
+
+def ple_source_loc(global_row, shard_rows):
+    """Which of the 128 source shards holds `global_row`."""
+    return divmod(int(global_row), int(shard_rows))
+
+
+# Rows per Q8G batch when writing a PLE head. 64 Ki rows × 160 × 4 B ≈ 40 MiB
+# of f32; a full head is ~12 GiB and does not fit beside a 22 GiB trunk tmp.
+PLE_Q8G_ROWS = 65536
+
+
+def write_q8g_row_chunks(tf, row_chunks, width, group=128):
+    """Write a Q8G matrix as independent row batches.
+
+    quantize_q8g groups along the last dim, so the cat of per-chunk (q,
+    scale) equals quantize_q8g on the stacked rows.
+    """
+    off = tf.tell()
+    scales = []
+    n_rows = 0
+    for chunk in row_chunks:
+        if chunk.dim() != 2 or int(chunk.shape[1]) != width:
+            raise ValueError(
+                f"Q8G chunk shape {tuple(chunk.shape)}, expected [N, {width}]")
+        x = chunk if chunk.dtype == torch.float32 else chunk.float()
+        q, sc, _shape = quantize_q8g(x)
+        tf.write(raw_bytes(q))
+        scales.append(sc.cpu())
+        n_rows += int(chunk.shape[0])
+        del q, x
+    if not scales:
+        raise ValueError("Q8G write with no rows")
+    sc_off = tf.tell()
+    sc = scales[0] if len(scales) == 1 else torch.cat(scales, 0)
+    tf.write(raw_bytes(sc))
+    return {"off": off, "scale_off": sc_off, "shape": [n_rows, width],
+            "group": group, "bytes": tf.tell() - off}
+
+
+def iter_ple_head_rows(st, shards, shard_rows, start, n_rows,
+                       batch=PLE_Q8G_ROWS):
+    """Yield f32 [take, width] slices of one logical PLE head.
+
+    One source shard stays loaded (≈800 MiB BF16). The previous full-head
+    cat was ~12 GiB of f32 and swapped the 48 GB machine.
+    """
+    row, end = int(start), int(start) + int(n_rows)
+    cached_si, cached = None, None
+    while row < end:
+        take = min(int(batch), end - row)
+        parts, need, pos = [], take, row
+        while need > 0:
+            si, local = ple_source_loc(pos, shard_rows)
+            n = min(int(shard_rows) - local, need)
+            if si != cached_si:
+                del cached
+                cached = st.raw(shards[si])
+                cached_si = si
+            sl = cached[local:local + n]
+            parts.append(sl if sl.dtype == torch.float32 else sl.float())
+            del sl
+            pos += n
+            need -= n
+        chunk = parts[0] if len(parts) == 1 else torch.cat(parts, 0)
+        del parts
+        yield chunk
+        row += take
+    del cached
+
 
 def is_glm(cfg):
     """GLM-5.3-Flash, by the name it gives itself.
@@ -222,6 +401,7 @@ def source_prefixes(cfg):
         Kimi-Linear   model.layers.N.…                  prefix ""
         Kimi K3       language_model.model.layers.N.…   prefix "language_model."
         GLM-5.3       model.language_model.layers.N.…   prefix ""
+        Qwen3.8       model.language_model.layers.N.…   prefix ""
 
     `src_pfx` is what the *checkpoint* puts before `layers.N` and is used to
     find the experts; `prefix` is what the engine puts before `model.` and
@@ -232,10 +412,10 @@ def source_prefixes(cfg):
     Returns the inner config too, since the same test decides whether there
     is a wrapper to unwrap at all."""
     prefix, src_pfx = "", "model."
-    if "text_config" in cfg:                 # K3 and GLM nest the text model
-        cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
-                                                if k != "text_config"}}
-        if is_glm(cfg):
+    if "text_config" in cfg:            # K3, GLM and Qwen nest the text model
+        outer = {k: v for k, v in cfg.items() if k != "text_config"}
+        cfg = {**cfg["text_config"], "_outer": outer}
+        if is_glm(cfg) or is_qwen(cfg):
             src_pfx = "model.language_model."
         else:
             prefix, src_pfx = "language_model.", "language_model.model."
@@ -311,6 +491,11 @@ def moe_layout(st, src_pfx, layer):
     `src_pfx` is everything the checkpoint puts before `layers.N` — which is
     not the container's tensor_prefix plus "model.", because GLM nests the
     two the other way round (see glm_rename)."""
+    # Qwen packs a whole layer's experts into two tensors rather than one
+    # per expert, so it is recognised by the packed pair and not by the
+    # per-expert probe below, which would find nothing.
+    if st.have(f"{src_pfx}layers.{layer}.mlp.experts.gate_up_proj"):
+        return "qwen_packed", "mlp", None
     for name, seg, tags in MOE_LAYOUTS:
         probe = f"{src_pfx}layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
         if st.have(probe) or st.have(probe + "_packed"):
@@ -372,7 +557,7 @@ class ShardReader:
             f.seek(base + beg)
             raw = f.read(end - beg)
         dt = {"BF16": torch.bfloat16, "F16": torch.float16,
-              "F32": torch.float32,
+              "F32": torch.float32, "I64": torch.int64,
               # The current generation of large MoEs ships fp8 with one f32
               # scale per weight_block_size tile in a companion tensor (K2,
               # DeepSeek V3/R1). Reading the values without applying those
@@ -577,12 +762,17 @@ def quantize_q8g(W, group=128):
 # ---------------------------------------------------------------- writing --
 
 def raw_bytes(t):
-    """Contiguous little-endian bytes of a tensor (torch has no .tobytes())."""
+    """Contiguous little-endian bytes of a tensor (torch has no .tobytes()).
+
+    Must not materialize a Python int per byte: a PLE Q8G head is ~3 GiB
+    of int8, and a list of that many ints will swap a 48 GB machine.
+    """
+    import ctypes
     t = t.detach().cpu().contiguous()
     n = t.numel() * t.element_size()
-    buf = torch.empty(n, dtype=torch.uint8)
-    buf.view(t.dtype)[:t.numel()] = t.flatten()
-    return bytes(memoryview(buf.numpy() if False else bytearray(buf.tolist())))
+    if n == 0:
+        return b""
+    return bytes((ctypes.c_char * n).from_address(int(t.data_ptr())))
 
 def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes,
                         packed=False):
@@ -674,10 +864,14 @@ class ShardDebt:
     """
 
     TRUNK = ("trunk",)
+    PLE = ("ple",)
+    SKIP = ("skip",)
 
     @staticmethod
     def name(who):
-        return f"layer {who[1]}" if who[0] == "layer" else " ".join(map(str, who))
+        if who[0] == "layer":
+            return f"layer {who[1]}"
+        return " ".join(map(str, who))
 
     @staticmethod
     def ledger(src):
@@ -695,8 +889,9 @@ class ShardDebt:
         except OSError:
             return set()
 
-    def __init__(self, weight_map, src):
+    def __init__(self, weight_map, src, skip=None):
         self.src = src
+        self.skip = skip
         self.ledger_path = os.path.join(src, ".reclaimed")
         self.owed = {}            # shard -> consumers that have not finished
         self.held_by = {}         # consumer -> the shards it is holding up
@@ -705,24 +900,38 @@ class ShardDebt:
             # one can give back, and counting it would report a saving twice.
             if not os.path.exists(os.path.join(src, shard)):
                 continue
-            who = self.consumer(name)
+            who = self.consumer(name, skip)
             self.owed.setdefault(shard, set()).add(who)
             self.held_by.setdefault(who, set()).add(shard)
         self.freed = 0
         self.released = []
 
     @staticmethod
-    def consumer(name):
+    def consumer(name, skip=None):
         """The one part of this script that reads `name`.
 
         The trunk pass takes everything that is not an expert. mxfp4 stores a
         tensor as a _packed/_scale pair and ST rejoins them, so both halves
         belong wherever the tensor they encode does.
+
+        Qwen packs a whole layer's experts into two tensors; those still
+        belong to that layer. Its PLE n-gram shards are a consumer of their
+        own, because build_ple runs *after* the trunk pass — a shard that
+        also holds an expert must not be deleted before the logical heads
+        have been written. And `skip` names what this conversion never reads
+        at all (Qwen's vision tower and MTP layer), so those shards are
+        given back at the start of a reclaim rather than held to the end.
+        It is passed in rather than assumed: GLM's checkpoint spells its
+        tower `model.visual.` too, and GLM *does* carry it.
         """
         base = name
         for suffix in ("_packed", "_scale"):
             if base.endswith(suffix):
                 base = base[:-len(suffix)]
+        if skip and skip(base):
+            return ShardDebt.SKIP
+        if is_ple_ngram(base) or is_ple_meta(base):
+            return ShardDebt.PLE
         if ".experts." not in base:
             return ShardDebt.TRUNK
         parts = base.split(".")
@@ -822,6 +1031,70 @@ def bank_codebook_base(path):
 
 # ------------------------------------------------------------- worker ----
 
+def convert_layer_packed(job, st, dev, t0):
+    """One Qwen layer: two packed tensors, split into WEXP records."""
+    (L, src, out, src_pfx, n_exp, stages, entries, index_bits, device,
+     cb_sample, cb_base, cached_ok) = job
+    bank = os.path.join(out, f"experts-L{L}.bin")
+    cbf = os.path.join(out, f"codebooks-L{L}.bin")
+    gname, dname = qwen_packed_names(src_pfx, L)
+    gate_up = st.tensor(gname)
+    down = st.tensor(dname)
+    e_all = int(gate_up.shape[0])
+    if not packed_shapes_ok(gate_up.shape, down.shape, e_all):
+        raise ValueError(
+            f"L{L} packed experts {tuple(gate_up.shape)} / {tuple(down.shape)} "
+            f"are not [E,2I,H] / [E,H,I]")
+    n_write = min(int(n_exp), e_all)
+    inter = int(gate_up.shape[1]) // 2
+    hid = int(gate_up.shape[2])
+    shapes = [(inter, hid), (inter, hid), (hid, inter)]
+    kinds = (("gate", 0, inter), ("up", inter, 2 * inter), ("down", None, None))
+
+    def matrix(e, kind, lo, hi):
+        if kind == "down":
+            return down[e]
+        return gate_up[e, lo:hi]
+
+    books, sample_ids = {}, list(range(0, n_write, max(1, n_write // cb_sample)))[:cb_sample]
+    per = max(1, TRAIN_VECTORS // len(sample_ids))
+    with open(cbf + ".tmp", "wb") as cf:
+        for ki, (kind, lo, hi) in enumerate(kinds):
+            chunks = []
+            for e in sample_ids:
+                W = matrix(e, kind, lo, hi)
+                sc = W.abs().amax(-1, keepdim=True).clamp(min=1e-8)
+                V = (W / sc).reshape(-1, VEC_DIM)
+                g = torch.Generator().manual_seed(1234 + e)
+                chunks.append(V[torch.randperm(V.shape[0], generator=g)[:per]])
+                del W, V
+            X = torch.cat(chunks); del chunks
+            books[kind] = train_codebooks(X, stages, dev, sample=TRAIN_VECTORS,
+                                          entries=entries)
+            del X
+            for si, C in enumerate(books[kind]):
+                cid = cb_base + ki * stages + si
+                cf.write(struct.pack("<IHBBII", MAGIC_CODEBOOK, cid & 0xFFFF,
+                                     FMT_VQ3R, VEC_DIM, entries, 0))
+                cf.write(raw_bytes(C.cpu().half()))
+    os.replace(cbf + ".tmp", cbf)
+
+    with open(bank + ".tmp", "wb") as f:
+        for e in range(n_write):
+            payloads, scales = [], []
+            for kind, lo, hi in kinds:
+                W = matrix(e, kind, lo, hi)
+                idx, sc = quantize_vq(W, books[kind], dev, entries=entries)
+                payloads.append(idx); scales.append(sc)
+                del W
+            write_expert_record(f, L, e, cb_base, payloads, scales, shapes,
+                                packed=(index_bits == 6))
+    os.replace(bank + ".tmp", bank)
+    del gate_up, down, books
+    gc.collect()
+    return (L, os.path.getsize(bank), cb_base, f"{time.time()-t0:.0f}s")
+
+
 def convert_layer(job):
     """One layer, in its own process. Layers share nothing: separate bank
     file and separate codebook file. The parent decides the base — from the
@@ -845,11 +1118,13 @@ def convert_layer(job):
     lname, seg, kinds = moe_layout(st, src_pfx, L)
     if lname is None:
         return (L, 0, cb_base, "missing")
+    t0 = _t.time()
+    if lname == "qwen_packed":
+        return convert_layer_packed(job, st, dev, t0)
 
     def ename(e, tag):
         return f"{src_pfx}layers.{L}.{seg}.experts.{e}.{tag}.weight"
 
-    t0 = _t.time()
     shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in kinds]
 
     books, sample_ids = {}, list(range(0, n_exp, max(1, n_exp // cb_sample)))[:cb_sample]
@@ -920,7 +1195,8 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
     # Which MoE naming this checkpoint uses. Read from the names themselves rather than
     # probed: build_trunk takes no prefix to build a probe with, and the index already
     # says. Only affects what the router and shared experts are WRITTEN as — see
-    # trunk_rename.
+    # trunk_rename. Qwen keeps its own names; it is not remapped onto
+    # block_sparse_moe.
     _trunk_seg = ("mlp" if any(".mlp.experts." in n for n in sr.names())
                   else "block_sparse_moe")
     if args.skip_trunk:
@@ -966,13 +1242,13 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
                 t = st.tensor(name)
                 if rename:
                     name = rename(name)
-                name = trunk_rename(name, _trunk_seg)
+                out_name = trunk_rename(name, _trunk_seg)
                 if reshape:
-                    t = reshape(name, t)
+                    t = reshape(out_name, t)
                 off = tf.tell()
                 if t.dim() == 1 or t.numel() < 1 << 16:
                     tf.write(raw_bytes(t.float()))
-                    tindex.append({"name": name, "fmt": FMT_F32, "off": off,
+                    tindex.append({"name": out_name, "fmt": FMT_F32, "off": off,
                                    "shape": list(t.shape),
                                    "bytes": tf.tell() - off})
                 else:
@@ -984,9 +1260,10 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
                     # streams mix for the whole layer, so an error there is
                     # not one weight's worth. Together they are 34 MB on
                     # GLM against the 4-bit alternative's 8.
-                    big = not (name.endswith("embed_tokens.weight")
-                               or name.endswith("lm_head.weight")
-                               or ".hc_attn_" in name or ".hc_ffn_" in name)
+                    big = not (out_name.endswith("embed_tokens.weight")
+                               or out_name.endswith("lm_head.weight")
+                               or ".hc_attn_" in out_name
+                               or ".hc_ffn_" in out_name)
                     bits = 8 if (args.trunk8 or not big) else args.trunk_bits
                     if bits == 3:
                         q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
@@ -997,7 +1274,7 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
                     tf.write(raw_bytes(q))
                     sc_off = tf.tell()
                     tf.write(raw_bytes(sc))
-                    tindex.append({"name": name, "fmt": fmt,
+                    tindex.append({"name": out_name, "fmt": fmt,
                                    "off": off, "shape": shape, "group": 128,
                                    "scale_off": sc_off,
                                    "bytes": tf.tell() - off})
@@ -1005,6 +1282,118 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
             os.fsync(tf.fileno())
         print(f"trunk: {os.path.getsize(trunk_tmp)/2**20:.0f} MB, "
               f"{len(tindex)} tensors")
+    return tindex
+
+
+def resolve_jobs(qwen, jobs):
+    """Parallel layer workers, when --jobs was not given.
+
+    Kimi keeps the measured sweet spot of 3. A Qwen worker holds a whole
+    layer's packed gate_up and down — 3.3 GiB of BF16 on Flash-Next, plus
+    the f32 it dequantizes into — so three of them at once is the one
+    setting that turns a conversion into a swap storm. Default 1; an
+    explicit --jobs always wins."""
+    if jobs is None:
+        return 1 if qwen else 3
+    return jobs
+
+
+def ple_heads_written(tindex, n_heads=PLE_HEADS):
+    """True when the trunk index lists every logical PLE head, 0..n_heads-1."""
+    found = set()
+    for t in tindex or []:
+        name = t.get("name") or ""
+        if "ngram_head." not in name:
+            continue
+        try:
+            found.add(int(name.split("ngram_head.", 1)[1].split(".", 1)[0]))
+        except ValueError:
+            continue
+    return found == set(range(n_heads))
+
+
+def reclaim_ple_if_complete(debt, mode, tindex):
+    """Give PLE shards back only after the 16 heads exist on the trunk.
+
+    --skip-trunk skips build_ple. Reclaiming then would delete n-gram
+    shards the container never received. Dry or on, the gate is the same:
+    the published (or just-written) trunk index must name all 16 heads.
+    """
+    if debt is None:
+        return False
+    if not ple_heads_written(tindex):
+        print("  reclaim: keeping PLE shards — trunk index does not list "
+              f"{PLE_HEADS} ngram_head tensors")
+        return False
+    reclaim(debt, mode, ShardDebt.PLE, "ple")
+    return True
+
+
+def ple_shard_map(names):
+    out = {}
+    for n in names:
+        if is_ple_ngram(n):
+            out[int(n.rsplit("shard_", 1)[1].split(".")[0])] = n
+    return out
+
+
+def qwen_ple_config(st, names):
+    """I64 PLE tables as Python ints — they are primes, and f32 cannot hold them."""
+    cfg = {}
+    for name in names:
+        if not st.have(name):
+            continue
+        key = None
+        if name.endswith("ngram_heads_offsets"):
+            key = "ple_head_offsets"
+        elif name.endswith("ngram_heads_vocab_sizes"):
+            key = "ple_head_vocab_sizes"
+        elif name.endswith("layer_multipliers"):
+            key = "ple_layer_multipliers"
+        if key:
+            cfg[key] = [int(x) for x in st.raw(name).reshape(-1).tolist()]
+    return cfg
+
+
+def build_ple(args, st, names, tindex):
+    """Split 128 source PLE shards into 16 Q8G heads on trunk.bin.tmp."""
+    shards = ple_shard_map(names)
+    if not shards:
+        return tindex
+    if any("ngram_head." in (t.get("name") or "") for t in tindex):
+        print(f"PLE: keeping {sum(1 for t in tindex if 'ngram_head.' in (t.get('name') or ''))} published heads")
+        return tindex
+    meta = qwen_ple_config(st, names)
+    offsets, sizes = meta.get("ple_head_offsets"), meta.get("ple_head_vocab_sizes")
+    if not offsets or not sizes or len(offsets) != PLE_HEADS or len(sizes) != PLE_HEADS:
+        raise RuntimeError("PLE ngram shards present but 16 offsets/vocab sizes missing")
+    first = shards[min(shards)]
+    sample = st.raw(first)
+    shard_rows, width = int(sample.shape[0]), int(sample.shape[1])
+    del sample
+    if width != PLE_HEAD_WIDTH:
+        raise ValueError(f"PLE shard width {width}, expected {PLE_HEAD_WIDTH}")
+    parts = first.split(".")
+    L = int(parts[parts.index("layers") + 1])
+    trunk_tmp = os.path.join(args.out, "trunk.bin.tmp")
+    slices = ple_head_slices(offsets, sizes)
+    print(f"PLE: {len(shards)} shards → {PLE_HEADS} heads of width {width}")
+    with open(trunk_tmp, "ab" if os.path.exists(trunk_tmp) else "wb") as tf:
+        for h, (start, n_rows) in enumerate(slices):
+            meta = write_q8g_row_chunks(
+                tf, iter_ple_head_rows(st, shards, shard_rows, start, n_rows),
+                width)
+            tindex.append({"name": (f"model.layers.{L}.ple.ple_embedding."
+                                    f"ngram_head.{h}.weight"),
+                           "fmt": FMT_Q8G, "off": meta["off"],
+                           "shape": meta["shape"],
+                           "group": meta["group"],
+                           "scale_off": meta["scale_off"],
+                           "bytes": meta["bytes"]})
+            print(f"  PLE head {h}: rows {n_rows}", flush=True)
+            gc.collect()
+        tf.flush()
+        os.fsync(tf.fileno())
     return tindex
 
 
@@ -1041,10 +1430,10 @@ def main():
                     help="experts only; keeps the trunk and the trunk index "
                          "the existing manifest describes, and republishes "
                          "the manifest with the layers this run converted")
-    ap.add_argument("--jobs", type=int, default=3,
-                    help="layers converted in parallel; measured sweet spot "
-                         "is 3 — beyond that the native encoder is already "
-                         "using every core")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="layers converted in parallel; default 3 for the "
+                         "Kimi family, 1 for Qwen packed experts unless "
+                         "this flag is set")
     ap.add_argument("--cb-sample", type=int, default=12,
                     help="experts sampled per layer to fit the codebooks")
     ap.add_argument("--reclaim", choices=("off", "dry", "on"), default="off",
@@ -1054,7 +1443,7 @@ def main():
                          "owed rather than the container plus the whole "
                          "checkpoint; 'dry' only says what it would delete")
     args = ap.parse_args()
-    if args.jobs < 1:
+    if args.jobs is not None and args.jobs < 1:
         ap.error("--jobs must be at least 1")
     if args.cb_sample < 1:
         ap.error("--cb-sample must be at least 1")
@@ -1070,6 +1459,15 @@ def main():
     if args.index_bits == 6 and (args.stages != 4 or args.entries != 64):
         ap.error("--index-bits 6 requires --stages 4 --entries 64")
 
+    # Read before the thread caps below, because --jobs defaults from the
+    # family: a Qwen layer's two packed tensors are far larger than one
+    # Kimi expert, and three of them at once is what a 48 GB machine cannot
+    # hold. See resolve_jobs.
+    cfg = json.load(open(os.path.join(args.src, "config.json")))
+    prefix, src_pfx, cfg = source_prefixes(cfg)
+    qwen = is_qwen(cfg)
+    args.jobs = resolve_jobs(qwen, args.jobs)
+
     # torch sizes its intra-op pool from os.cpu_count() by default, so N
     # worker processes would otherwise spawn N*cpus threads and thrash each
     # other off the machine. Cap each worker at its fair share of the cores;
@@ -1081,14 +1479,13 @@ def main():
     os.environ.setdefault("MKL_NUM_THREADS", str(per))
 
     os.makedirs(args.out, exist_ok=True)
-    cfg = json.load(open(os.path.join(args.src, "config.json")))
-    prefix, src_pfx, cfg = source_prefixes(cfg)
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
 
     # ---- staging reclaim: refuse before anything is deleted, not during --
     debt = None
+    skip_tensor = qwen_skip_tensor if qwen else None
     if args.reclaim != "off":
         src_real, out_real = os.path.realpath(args.src), os.path.realpath(args.out)
         if (src_real == out_real
@@ -1133,14 +1530,14 @@ def main():
         # shards are already gone. Say which flag makes that a run rather
         # than a truncated container.
         if gone and not args.skip_trunk and any(
-                ShardDebt.consumer(name) == ShardDebt.TRUNK
+                ShardDebt.consumer(name, skip_tensor) == ShardDebt.TRUNK
                 and fn in gone for name, fn in st.wm.items()):
             print(f"--reclaim already consumed the shards the trunk is built "
                   f"from; rerun with --skip-trunk to keep the trunk "
                   f"{os.path.join(args.out, 'manifest.json')} publishes",
                   file=sys.stderr)
             return 1
-        debt = ShardDebt(st.wm, args.src)
+        debt = ShardDebt(st.wm, args.src, skip_tensor)
         n_shards, held = debt.still_owed()
         print(f"reclaim={args.reclaim}: {n_shards} shards, "
               f"{human(held)} of staging to give back"
@@ -1160,6 +1557,8 @@ def main():
     # ---- what this converter refuses to guess at, on GLM -----------------
     glm = is_glm(cfg)
     drop_trunk = None
+    rename = None
+    reshape = None
     if glm:
         # Cross-layer top-k sharing: a "shared" indexer layer reuses the
         # previous full layer's selection instead of running an indexer of
@@ -1177,6 +1576,10 @@ def main():
             return 1
 
         drop_trunk = glm_drop_trunk(src_pfx, n_layers)
+        rename, reshape = glm_rename, glm_flatten
+    elif qwen:
+        drop_trunk = qwen_drop_trunk()
+        rename = qwen_rename
     first_dense = cfg.get("first_k_dense_replace", 0)
     if args.experts:
         n_exp = min(n_exp, args.experts)
@@ -1196,18 +1599,20 @@ def main():
     merged = os.path.join(args.out, "codebooks.bin")
     old_books = 0
     old_quant = existing.get("expert_quant", {}) if existing else {}
+    merged_ok = (os.path.exists(merged)
+                 and os.path.getsize(merged) % cb_record_bytes == 0)
     compatible = bool(
-        existing and os.path.exists(merged) and
+        existing and merged_ok and
         old_quant.get("stages") == args.stages and
         old_quant.get("vec_dim") == VEC_DIM and
         old_quant.get("entries") == args.entries and
-        old_quant.get("index_bits", 8) == args.index_bits and
-        os.path.getsize(merged) % cb_record_bytes == 0)
-    if compatible:
+        old_quant.get("index_bits", 8) == args.index_bits)
+    # Merge can finish before the manifest (tokenizer / trunk / PLE). Count
+    # those records even with no manifest, or every bank is rewritten and
+    # assigned a base past the file.
+    if merged_ok:
         old_books = os.path.getsize(merged) // cb_record_bytes
-        manifest_layers = dict(existing.get("layers", {}))
-    else:
-        manifest_layers = {}
+    manifest_layers = dict(existing.get("layers", {})) if compatible else {}
 
 
     # Layout is a property of the checkpoint, so probe once on the first MoE layer
@@ -1225,8 +1630,16 @@ def main():
         return f"{src_pfx}layers.{L}.{_seg}.experts.{e}.{tag}.weight"
 
     n_cb_per_layer = 3 * args.stages
-    next_base = old_books
-    jobs = []
+    span = n_layers * n_cb_per_layer
+
+    def layer_source_ok(L):
+        if _lname == "qwen_packed":
+            return st.have(qwen_packed_names(src_pfx, L)[0])
+        _t0 = _kinds[0][1]
+        return (st.have(ename(L, 0, _t0)) or
+                st.have(ename(L, 0, _t0) + "_packed"))
+
+    recovered_for = {}
     for L in layers:
         meta = manifest_layers.get(str(L), {})
         bank = os.path.join(args.out, f"experts-L{L}.bin")
@@ -1239,46 +1652,59 @@ def main():
             meta.get("bytes") == os.path.getsize(bank))
         if not cached_ok:
             # A run interrupted before it published anything leaves no
-            # manifest and no codebooks.bin, so there is nothing to read a
-            # base from — and re-deriving one positionally is the bug this
-            # scheme exists to avoid. But a finished bank names its own
-            # base in every record it holds, and its unmerged codebook part
-            # is still on disk beside it. Together those are a complete,
-            # self-describing layer, so honour them.
+            # manifest, so there is nothing to read a base from. A finished
+            # bank names its own base. After merge the per-layer parts are
+            # gone — honour a base that already sits inside codebooks.bin
+            # (PLE interrupt) or one that still has its unmerged part.
             recovered = bank_codebook_base(bank)
-            # Bounded by the whole model, not by this invocation's --layers:
-            # the base in the bank reflects the run that wrote it, which may
-            # have been converting far more layers than this one is.
-            if (old_books <= recovered <=
-                    old_books + n_layers * n_cb_per_layer and
-                    os.path.exists(part) and
-                    os.path.getsize(part) == n_cb_per_layer * cb_record_bytes
-                    and os.path.getsize(bank) > 0):
+            in_merge = (recovered >= 0 and os.path.exists(bank)
+                        and os.path.getsize(bank) > 0
+                        and recovered + n_cb_per_layer <= old_books)
+            pending = (old_books <= recovered <= old_books + span
+                       and os.path.exists(part)
+                       and os.path.getsize(part)
+                       == n_cb_per_layer * cb_record_bytes
+                       and os.path.exists(bank)
+                       and os.path.getsize(bank) > 0)
+            if in_merge or pending:
                 base = recovered
                 cached_ok = True
-        _t0 = _kinds[0][1]
-        source_ok = (st.have(ename(L, 0, _t0)) or
-                     st.have(ename(L, 0, _t0) + "_packed"))
-        if not cached_ok:
+        if cached_ok:
+            recovered_for[L] = base
+
+    used = set(recovered_for.values())
+    holes = [b for b in range(0, old_books, n_cb_per_layer) if b not in used]
+    next_base = old_books
+    jobs = []
+    for L in layers:
+        source_ok = layer_source_ok(L)
+        if L in recovered_for:
+            base, cached_ok = recovered_for[L], True
+            if base + n_cb_per_layer > next_base:
+                next_base = base + n_cb_per_layer
+        elif holes:
+            # A bank rewritten then deleted left a hole in the merge.
+            # Reuse that base; do not append past the merged file.
+            base, cached_ok = holes.pop(0), False
+        else:
+            cached_ok = False
             base = next_base
             if source_ok:
                 next_base += n_cb_per_layer
-        elif base + n_cb_per_layer > next_base:
-            next_base = base + n_cb_per_layer
         jobs.append((L, args.src, args.out, src_pfx, n_exp, args.stages,
                      args.entries, args.index_bits, str(dev), args.cb_sample,
                      base, cached_ok))
 
     tindex = None
     if debt is not None:
+        reclaim(debt, args.reclaim, ShardDebt.SKIP, "excluded tensors")
         # The trunk pass consumes every tensor that is not an expert, so
         # until it has run almost no shard is fully spent. Run it first. It
         # writes trunk.bin.tmp either way and the published trunk.bin is
         # still only replaced together with the manifest, so nothing about
         # what this run can survive changes — only the order.
-        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
-                             glm_rename if glm else None,
-                             glm_flatten if glm else None)
+        tindex = build_trunk(args, sr, st, existing, manifest_path,
+                             drop_trunk, rename, reshape)
         if tindex is None:
             return 1
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
@@ -1325,6 +1751,12 @@ def main():
             results.append(res)
             print(f"  layer {res[0]}: {res[1]/2**20:.0f} MB [{res[3]}]", flush=True)
             reclaim_layer(res[0], res[1])
+            gc.collect()
+            if str(dev) == "mps" and hasattr(torch, "mps"):
+                try:
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
 
     for L, sz, base, how in sorted(results):
         if sz:
@@ -1342,29 +1774,39 @@ def main():
              for res in results]
     if any(os.path.exists(p) for _, p in parts):
         with open(merged + ".tmp", "wb") as cb_out:
-            if compatible:
+            if old_books > 0:
                 with open(merged, "rb") as old:
                     shutil.copyfileobj(old, cb_out)
             for base, part in sorted(parts):
                 if os.path.exists(part):
                     if os.path.getsize(part) != n_cb_per_layer * cb_record_bytes:
                         raise RuntimeError(f"malformed codebook part: {part}")
-                    expected = cb_out.tell() // cb_record_bytes
-                    if base < expected:
-                        raise RuntimeError(
-                            f"codebook base {base} overlaps the {expected} "
-                            f"records already written")
-                    if base > expected:
+                    dest = base * cb_record_bytes
+                    end = cb_out.tell()
+                    chunk = n_cb_per_layer * cb_record_bytes
+                    if dest + chunk <= end:
+                        # Hole refill: the merge already holds this slot.
+                        cb_out.seek(dest)
+                        with open(part, "rb") as pf:
+                            shutil.copyfileobj(pf, cb_out)
+                        cb_out.seek(end)
+                    elif dest == end:
+                        with open(part, "rb") as pf:
+                            shutil.copyfileobj(pf, cb_out)
+                    elif dest > end:
                         # A resume can recover a bank whose base sits past
                         # the end of what is being written, because an
                         # earlier run finished a layer this invocation is
                         # not redoing. No record names the ids in between,
                         # so pad them: the bases inside the banks are the
                         # engine's truth and cannot be moved.
-                        cb_out.write(b"\0" * ((base - expected) *
-                                              cb_record_bytes))
-                    with open(part, "rb") as pf:
-                        shutil.copyfileobj(pf, cb_out)
+                        cb_out.write(b"\0" * (dest - end))
+                        with open(part, "rb") as pf:
+                            shutil.copyfileobj(pf, cb_out)
+                    else:
+                        raise RuntimeError(
+                            f"codebook base {base} overlaps the "
+                            f"{end // cb_record_bytes} records already written")
                     os.remove(part)
             cb_out.flush()
             os.fsync(cb_out.fileno())
@@ -1384,20 +1826,25 @@ def main():
             copied_tok = True
             break
     # A release with no tiktoken rank file but a `tokenizers` tokenizer.json
-    # — GLM's shape. Re-encoded rather than copied, and refused rather than
-    # approximated when its pattern or its merge order is not the one
-    # src/tokenizer.c implements. See tools/hf_tokenizer.py.
+    # — GLM's shape, and Qwen's. Re-encoded rather than copied, and refused
+    # rather than approximated when its pattern or its merge order is not
+    # one src/tokenizer.c implements. See tools/hf_tokenizer.py.
     if not copied_tok and os.path.exists(os.path.join(args.src, "tokenizer.json")):
         import hf_tokenizer
-        text, han_split, tok_specials = hf_tokenizer.convert(args.src)
+        text, han_split, tok_specials, digit_run = hf_tokenizer.convert(args.src)
         atomic_text(os.path.join(args.out, "tokenizer.model"), text)
         # The engine defaults to the Kimi pattern, so only the other case is
         # written — and it is written, not inferred at load: the difference
-        # is one token on "A股" and shows up nowhere as an error.
+        # is one token on "A股" and shows up nowhere as an error. The same
+        # goes for the digit run: Qwen tokenizes "2026" as four pieces and
+        # Kimi as one, and neither can be guessed from the vocabulary.
         if not han_split:
             cfg["tokenizer_han_split"] = False
+        if digit_run != 3:
+            cfg["tokenizer_digit_run"] = digit_run
         print(f"tokenizer: re-encoded tokenizer.json"
-              f"{'' if han_split else ' (no Han branch in its pattern)'}")
+              f"{'' if han_split else ' (no Han branch in its pattern)'}"
+              f"{'' if digit_run == 3 else f', {digit_run} digit per piece'}")
 
     # ---- special tokens --------------------------------------------------
     # tiktoken's rank file holds only ordinary merges; the markup tokens live
@@ -1529,6 +1976,10 @@ def main():
     # does, and K3 normalizes to [-1, 1] with mean = std = 0.5, which is
     # not what CLIP does. Guess nothing that the release states.
     vc = cfg.get("_outer", {}).get("vision_config")
+    if vc and qwen:
+        # The Qwen tower is not carried (see qwen_drop_trunk), so a
+        # vision.json would describe weights this container does not hold.
+        vc = None
     if vc and glm:
         # Two towers, and the engine has to be told which. They agree on
         # almost nothing below the block level: GLM has no learned position
@@ -1609,11 +2060,15 @@ def main():
     # --reclaim has already run this, before the experts, so that the shards
     # holding non-expert tensors become deletable at all.
     if tindex is None:
-        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
-                             glm_rename if glm else None,
-                             glm_flatten if glm else None)
+        tindex = build_trunk(args, sr, st, existing, manifest_path,
+                             drop_trunk, rename, reshape)
         if tindex is None:
             return 1
+    if qwen:
+        if not args.skip_trunk:
+            tindex = build_ple(args, st, list(sr.names()), tindex)
+        if debt is not None:
+            reclaim_ple_if_complete(debt, args.reclaim, tindex)
     trunk_path = os.path.join(args.out, "trunk.bin")
     trunk_tmp = trunk_path + ".tmp"
 
@@ -1628,13 +2083,21 @@ def main():
     arch = ("kimi-k3" if "KimiK3" in _hf else
             "kimi-linear" if "KimiLinear" in _hf else
             "glm5-next" if "Glm5Next" in _hf else
+            QWEN_TEXT_TYPE if qwen else
             _hf or cfg.get("model_type", "unknown"))
+
+    man_cfg = normalise_cfg(cfg)
+    if qwen:
+        # The PLE head offsets and vocab sizes are i64 primes near 2e7:
+        # they do not survive a float round-trip, and the engine indexes
+        # rows with them. Written as Python ints from the source tables.
+        man_cfg.update(qwen_ple_config(st, list(sr.names())))
 
     manifest = {
         "format_version": 0,
         "arch": arch,
         "tensor_prefix": prefix,
-        "config": normalise_cfg(cfg),
+        "config": man_cfg,
         # The record's fmt byte is FMT_VQ3R for every stage count but 2 — the
         # engine takes the stage and entry counts from here, not from the
         # byte, and only refuses a fmt that is neither VQ3R nor VQ2R.

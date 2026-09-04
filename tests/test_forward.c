@@ -95,6 +95,15 @@ int main(int argc, char **argv)
     for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[best]) best = v;
     printf("prefill %d tok in %.2fs (%.2f tok/s); argmax %d, max %.4f\n",
            n, tp, n / tp, best, lg[best]);
+    if (m.cfg.arch_qwen && m.has_qsa) {
+        const int compress = m.cfg.idx_compress > 0 ? m.cfg.idx_compress : 4;
+        for (int L = 0; L < m.cfg.n_layers; L++) {
+            if (!m.cfg.qwen_full[L]) continue;
+            printf("qsa_layer %d n_kv %d blk %d tail %d compress %d\n",
+                   L, m.n_kv[L], m.n_qsa_blk[L], m.n_qsa_tail[L], compress);
+            break;
+        }
+    }
 
     if (out) {
         FILE *f = fopen(out, "wb");

@@ -125,6 +125,42 @@ def main():
            "a hand-edited chat.json outranks the shipped one")
         ck(build(tmp, "other", "LlamaForCausalLM", KL_MARKERS) is None,
            "nothing is known for another architecture, so nothing is guessed")
+
+        print("chat_template.jinja")
+        src = H.make_src(os.path.join(tmp, "kimi-jinja-src"))
+        io.open(os.path.join(src, "chat_template.jinja"), "w",
+                encoding="utf-8").write("KIMI-TPL")
+        out = os.path.join(tmp, "kimi-jinja.waste")
+        os.makedirs(out)
+        H.run(out, src)
+        got = io.open(os.path.join(out, "chat_template.jinja"),
+                      encoding="utf-8").read()
+        ck(got == "KIMI-TPL", "Kimi still copies chat_template.jinja")
+
+        src = H.make_src(os.path.join(tmp, "qwen-jinja-src"))
+        cfg = json.load(open(os.path.join(src, "config.json")))
+        cfg["architectures"] = ["Qwen4ExpForConditionalGeneration"]
+        cfg["model_type"] = "qwen4_exp"
+        cfg["text_config"] = {
+            "model_type": "qwen4_exp_text",
+            "num_hidden_layers": cfg["num_hidden_layers"],
+            "num_experts": cfg["num_experts"],
+            "num_experts_per_tok": 2,
+            "first_k_dense_replace": cfg.get("first_k_dense_replace", 1),
+            "hidden_size": cfg["hidden_size"],
+            "moe_intermediate_size": cfg["moe_intermediate_size"],
+            "vocab_size": cfg["vocab_size"],
+        }
+        json.dump(cfg, open(os.path.join(src, "config.json"), "w"))
+        io.open(os.path.join(src, "chat_template.jinja"), "w",
+                encoding="utf-8").write("QWEN-TOOLS")
+        out = os.path.join(tmp, "qwen-jinja.waste")
+        os.makedirs(out)
+        H.run(out, src)
+        got = io.open(os.path.join(out, "chat_template.jinja"),
+                      encoding="utf-8").read()
+        ck(got == "QWEN-TOOLS",
+           "Qwen carries its chat template like any other release")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -5412,3 +5412,57 @@ nothing at all — silently, since the conversation still came out valid.
 is the other half. **A test that only compares a thing to itself is not a
 weak oracle, it is not an oracle**, and the three protocols this repo
 renders now each have one.
+
+## 74. Qwen3.8-Flash-Next: what was new, and what only looked new (2026-09-04)
+
+Four architectural pieces this engine had never run — Gated DeltaNet,
+Qwen Sparse Attention, HyperConnection, and a per-layer n-gram embedding —
+and the useful finding is how little of the *engine* they touched. The
+container format did not change: a packed `[E, 2I, H]` gate_up beside an
+`[E, H, I]` down splits into exactly the WEXP records everything else
+writes, one expert per 4 KiB-aligned record, so routing still costs one
+`pread` and the expert cache, the read-ahead and the expert-parallel path
+were reused unmodified. What is genuinely Qwen's is five self-contained
+kernel files and a loader branch.
+
+**The 80 GiB trunk that is 2.6 GB resident.** The n-gram tables are 16
+heads of ~20 M rows, 78 of the trunk file's 80.51 GiB. Held resident they
+would exceed the whole RAM budget on any machine this targets; read a row
+per head per token they cost one Q8G row each. The same exclusion the
+embedding table has always had, for the same reason, and it is what makes
+a 176.94 B model open with a 3.11 GB floor. The converter has the mirror
+problem: a head is ~12 GiB as f32, so it is written 64 Ki rows at a time,
+relying on Q8G grouping along the last dimension to make the batches
+reconstruct what quantizing the head whole would have produced.
+
+**8 GiB of expert cache, and nothing above it.** Measured over 48 greedy
+tokens: 4 GiB gives 3.20 tok/s at an 8% hit rate, 8 GiB gives 4.97 at 64%,
+16 GiB gives 4.92 at 88%. The collapse below one working set is §3's rule
+again — below a multiple the hit rate is zero, not low. The flat top is
+the more useful half: **24 points of hit rate bought nothing**, because at
+64% the remaining reads already overlap the arithmetic. A cache sized to
+the machine rather than to the knee spends RAM for no tokens.
+
+**A tokenizer difference that no vocabulary test could see.** Qwen's
+pre-tokenization pattern is `\p{N}` where Kimi's and GLM's are
+`\p{N}{1,3}`: every digit is its own piece. `tools/hf_tokenizer.py` was
+right to refuse the pattern rather than approximate it, and the engine now
+carries `tokenizer_digit_run` the way it already carried
+`tokenizer_han_split`. The trap is in the checking, not the fixing —
+**Qwen's vocabulary contains no multi-digit token at all**, so on this
+checkpoint the two settings produce identical ids and every parity test
+passes either way. "202" has no merge to reach. The flag is therefore
+tested on a synthetic vocabulary that does hold `20`, where the pre-token
+boundary is directly visible. A parity test against the release would have
+green-lit the wrong pattern for the next member of the family.
+
+**An unexplained 4e-3.** The container-native oracle and the engine read
+the same trunk dequantized to the same f32, so their difference should be
+summation order — around 1e-6. It is 4e-3 relative per layer. Routed
+expert ids and weights match exactly at every layer and the argmax matches,
+so nothing observable is wrong, and end-to-end generation is coherent on
+the real checkpoint. It is recorded here undiagnosed rather than absorbed
+into a tolerance: 4e-3 is close to bf16's epsilon and nothing in that path
+should be rounding to bf16. The suite gates at the measured value so the
+number cannot grow while nobody is looking, which is the least a check can
+do about a thing it does not understand.

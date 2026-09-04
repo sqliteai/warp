@@ -32,6 +32,47 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
+from convert import (                                             # noqa: E402
+    qwen_packed_names, ple_source_loc, ple_shard_map)
+
+# Where the Qwen checkpoint puts its layers. The container's tensor_prefix
+# is "" on this family (see convert.source_prefixes), so it cannot be used
+# to build a *source* name.
+QWEN_SRC_PFX = "model.language_model."
+
+
+def dequant_q8g(payload, scales, shape, group=128):
+    """A whole Q8G tensor. The reference dequant_q8g_row is checked against."""
+    rows, N = 1, shape[-1]
+    for s in shape[:-1]:
+        rows *= s
+    ng = (N + group - 1) // group
+    q = torch.frombuffer(bytearray(payload), dtype=torch.int8).reshape(rows, ng, group)
+    sc = torch.frombuffer(bytearray(scales), dtype=torch.float16).float().reshape(rows, ng, 1)
+    return (q.float() * sc).reshape(rows, ng * group)[:, :N].reshape(*shape)
+
+
+def dequant_q8g_row(q_row, sc_row, width, group=128):
+    """One Q8G row without materializing the whole matrix.
+
+    A PLE head is ~20 M rows. Slurping trunk.bin (81 GiB) or dequantizing
+    the head as f32 (~12 GiB) swaps a 48 GB machine.
+    """
+    ng = (width + group - 1) // group
+    pad = ng * group
+    q = torch.frombuffer(bytearray(q_row), dtype=torch.int8)[:pad].view(ng, group)
+    sc = torch.frombuffer(bytearray(sc_row), dtype=torch.float16).float().view(ng, 1)
+    return (q.float() * sc).reshape(pad)[:width]
+
+
+def packed_expert_src(eid, kind, cache):
+    """One expert's gate / up / down out of the layer's packed pair."""
+    gate_up, down, inter = cache
+    if kind == "gate":
+        return gate_up[eid, :inter]
+    if kind == "up":
+        return gate_up[eid, inter:]
+    return down[eid]
 
 
 def load_codebooks(path):
@@ -93,6 +134,8 @@ def main():
     ap.add_argument("--container", required=True)
     ap.add_argument("--src", default="/Volumes/WasteDisk/kimi-linear")
     ap.add_argument("--experts", type=int, default=4, help="how many to check")
+    ap.add_argument("--layers", default="",
+                    help="comma list of layer ids; default = all")
     args = ap.parse_args()
 
     man = json.load(open(os.path.join(args.container, "manifest.json")))
@@ -103,34 +146,45 @@ def main():
 
     sr = ST(args.src)
     prefix = man.get("tensor_prefix", "")
+    want = None
+    if args.layers.strip():
+        want = {int(x) for x in args.layers.split(",") if x.strip()}
     ok = True
     for lstr, meta in man["layers"].items():
         L = int(lstr)
+        if want is not None and L not in want:
+            continue
         bank = open(os.path.join(args.container, meta["file"]), "rb").read()
         assert len(bank) == meta["bytes"]
         shapes = []
+        moe_segment, src_kinds = "block_sparse_moe", KINDS
 
-        deepseek_probe = (
-            f"{prefix}model.layers.{L}.mlp.experts.0.gate_proj.weight"
-        )
-        use_deepseek_names = sr.have(deepseek_probe)
-
-        if use_deepseek_names:
+        # Qwen packs a whole layer's experts into two tensors, so there is
+        # no per-expert tensor to read a shape from and no per-expert slice
+        # to compare against — both come out of the pair. Probed on the
+        # source, like the DeepSeek naming below.
+        gname, dname = qwen_packed_names(QWEN_SRC_PFX, L)
+        packed_cache = None
+        if sr.have(gname):
+            gate_up, down = sr.tensor(gname), sr.tensor(dname)
+            inter = int(gate_up.shape[1]) // 2
+            hid = int(gate_up.shape[2])
+            packed_cache = (gate_up, down, inter)
+            shapes = [(inter, hid), (inter, hid), (hid, inter)]
+        elif sr.have(f"{prefix}model.layers.{L}.mlp.experts.0.gate_proj.weight"):
             src_kinds = (
                 ("gate", "gate_proj"),
                 ("up", "up_proj"),
                 ("down", "down_proj"),
             )
             moe_segment = "mlp"
-        else:
-            src_kinds = KINDS
-            moe_segment = "block_sparse_moe"
 
-        for _kind, tag in src_kinds:
-            t = sr.tensor(
-                f"{prefix}model.layers.{L}.{moe_segment}.experts.0.{tag}.weight"
-            )
-            shapes.append(tuple(t.shape))
+        if packed_cache is None:
+            for _kind, tag in src_kinds:
+                t = sr.tensor(
+                    f"{prefix}model.layers.{L}.{moe_segment}.experts.0.{tag}.weight"
+                )
+                shapes.append(tuple(t.shape))
 
         off, checked = 0, 0
         while off < len(bank) and checked < args.experts:
@@ -139,9 +193,12 @@ def main():
                                            man["expert_quant"].get("index_block", 0))
             assert off % ALIGN == 0, f"record {eid} not 4 KiB aligned"
             for i, (kind, tag) in enumerate(src_kinds):
-                W = sr.tensor(
-                    f"{prefix}model.layers.{L}.{moe_segment}.experts.{eid}.{tag}.weight"
-                )
+                if packed_cache is not None:
+                    W = packed_expert_src(eid, kind, packed_cache)
+                else:
+                    W = sr.tensor(
+                        f"{prefix}model.layers.{L}.{moe_segment}.experts.{eid}.{tag}.weight"
+                    )
                 err = (W - rec[kind]).norm() / W.norm()
                 flag = "ok " if err < 0.30 else "BAD"
                 if err >= 0.30:
@@ -153,6 +210,44 @@ def main():
         print(f"  layer {L}: {len(bank)//ALIGN} blocks, "
               f"{meta['experts']} experts, {len(bank)/2**20:.1f} MB, "
               f"{len(bank)/meta['experts']/2**20:.2f} MB/expert")
+        del bank, packed_cache
+
+    cfg = man.get("config") or {}
+    offsets, sizes = cfg.get("ple_head_offsets"), cfg.get("ple_head_vocab_sizes")
+    shards = ple_shard_map(sr.wm)
+    if offsets and sizes and shards:
+        print("PLE rows")
+        trunk_path = os.path.join(args.container, "trunk.bin")
+        heads = [t for t in man["trunk"]
+                 if "ngram_head." in t.get("name", "")]
+        sample = sr.raw(shards[min(shards)])
+        shard_rows = int(sample.shape[0])
+        del sample
+        group = 128
+        with open(trunk_path, "rb") as tf:
+            for t in heads:
+                h = int(t["name"].split("ngram_head.")[1].split(".")[0])
+                n_rows = int(sizes[h])
+                start = int(offsets[h])
+                width = int(t["shape"][-1])
+                ng = (width + group - 1) // group
+                pad = ng * group
+                for local in (0, n_rows // 2, n_rows - 1):
+                    gi = start + local
+                    si, lr = ple_source_loc(gi, shard_rows)
+                    src = sr.raw(shards[si])[lr].float()
+                    tf.seek(t["off"] + local * pad)
+                    q = tf.read(pad)
+                    tf.seek(t["scale_off"] + local * ng * 2)
+                    sc = tf.read(ng * 2)
+                    recon = dequant_q8g_row(q, sc, width, group)
+                    err = (src - recon).norm() / src.norm().clamp(min=1e-8)
+                    flag = "ok " if err < 0.05 else "BAD"
+                    if err >= 0.05:
+                        ok = False
+                    print(f"  head {h} row {local} (src shard {si}[{lr}]) "
+                          f"rel err {err:>6.2%}  {flag}")
+                    del src
 
     print("\nPASS — container round-trips" if ok else "\nFAIL")
     return 0 if ok else 1

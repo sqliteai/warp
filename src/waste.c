@@ -340,7 +340,8 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         char nm[160];
         js_str(&d, js_get(&d, e, "name"), nm, sizeof nm);
         const int fmt = (int)js_int(&d, js_get(&d, e, "fmt"), 0);
-        if (fmt != 0 && strstr(nm, "embed_tokens.weight")) continue;
+        if (fmt != 0 && (strstr(nm, "embed_tokens.weight") ||
+                         strstr(nm, "ngram_head."))) continue;
         const uint64_t nb = (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
         /* The tower is loaded only when a caller asks for images, so it is
          * counted apart and folded in by waste_open — counting it here
@@ -426,14 +427,51 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int kl = js_get(&d, lac, "kda_layers");
     const int n_kda = js_size(&d, kl);
     const int n_mla = layers - n_kda;
+    char mt[48];
+    js_str(&d, js_get(&d, cfg, "model_type"), mt, sizeof mt);
+    const int is_qwen = (strcmp(mt, "qwen4_exp_text") == 0);
 
     /* MLA caches the latent plus the rope dims, not the expanded per-head
      * K and V — kv_b_proj is absorbed into the query and the output. That
-     * is 576 floats per token per layer here rather than 30720. */
-    out->state_bytes = (uint64_t)n_kda * kh * kd * kd * 4                /* S */
-                     + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4      /* conv */
-                     + (uint64_t)n_mla * ctx_tokens *
-                       ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
+     * is 576 floats per token per layer here rather than 30720.
+     * Qwen is not MLA: GDN S is [Hv][Dk][Dv], QSA keeps BF16 K/V plus
+     * every raw FP32 index key so pooling uses one tested path. */
+    if (is_qwen) {
+        const int Hk = (int)js_int(&d, js_get(&d, cfg, "linear_num_key_heads"), 0);
+        const int Hv = (int)js_int(&d, js_get(&d, cfg, "linear_num_value_heads"), 0);
+        const int Dk = (int)js_int(&d, js_get(&d, cfg, "linear_key_head_dim"), 0);
+        const int Dv = (int)js_int(&d, js_get(&d, cfg, "linear_value_head_dim"), 0);
+        const int gck = (int)js_int(&d, js_get(&d, cfg, "linear_conv_kernel_dim"), 4);
+        const int nkv = (int)js_int(&d, js_get(&d, cfg, "num_key_value_heads"), 0);
+        const int hd = (int)js_int(&d, js_get(&d, cfg, "head_dim"), 0);
+        const int idim = (int)js_int(&d, js_get(&d, cfg, "indexer_head_dim"), 128);
+        const int hc = (int)js_int(&d, js_get(&d, cfg, "hc_count"), 4);
+        const int ngram = (int)js_int(&d, js_get(&d, cfg, "ngram_size"), 3);
+        const int pck = (int)js_int(&d, js_get(&d, cfg, "ple_conv_kernel_size"), 4);
+        const int lt = js_get(&d, cfg, "layer_types");
+        int n_gdn = 0, n_qsa = 0;
+        for (int i = 0; i < js_size(&d, lt); i++) {
+            char kind[32];
+            js_str(&d, js_at(&d, lt, i), kind, sizeof kind);
+            if (strcmp(kind, "full_attention") == 0) n_qsa++;
+            else n_gdn++;
+        }
+        const int qkv = 2 * Hk * Dk + Hv * Dv;
+        const int R = (pck > 1 && ngram > 0) ? (pck - 1) * ngram : 0;
+        out->state_bytes =
+            (uint64_t)n_gdn * (uint64_t)Hv * Dk * Dv * 4u +
+            (uint64_t)n_gdn * (uint64_t)qkv * (gck > 0 ? gck - 1 : 0) * 4u +
+            (uint64_t)n_qsa * ctx_tokens * (uint64_t)nkv * hd * 2u * 2u +
+            (uint64_t)n_qsa * ctx_tokens * (uint64_t)idim * 4u +
+            (uint64_t)hc * hidden * 4u +
+            (uint64_t)hc * hidden * (uint64_t)R * 4u;
+        (void)n_kda; (void)n_mla; (void)kh; (void)kd; (void)ck;
+    } else {
+        out->state_bytes = (uint64_t)n_kda * kh * kd * kd * 4                /* S */
+                         + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4      /* conv */
+                         + (uint64_t)n_mla * ctx_tokens *
+                           ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
+    }
     (void)qk_nope; (void)v_head;
     {   /* The DSA indexer's pooled keys are session state too: one
          * index_dim vector per index_kpool tokens per full-attention layer.
@@ -468,7 +506,21 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         js_free(&d); free(src); return WASTE_E_FORMAT;
     }
     const int nb = ares ? layers / ares + 2 : 1;
-    const int big = hidden > kh * kd ? hidden : kh * kd;
+    int big = hidden > kh * kd ? hidden : kh * kd;
+    if (is_qwen) {
+        const int hc = (int)js_int(&d, js_get(&d, cfg, "hc_count"), 4);
+        const int Hk = (int)js_int(&d, js_get(&d, cfg, "linear_num_key_heads"), 0);
+        const int Hv = (int)js_int(&d, js_get(&d, cfg, "linear_num_value_heads"), 0);
+        const int Dk = (int)js_int(&d, js_get(&d, cfg, "linear_key_head_dim"), 0);
+        const int Dv = (int)js_int(&d, js_get(&d, cfg, "linear_value_head_dim"), 0);
+        const int hd = (int)js_int(&d, js_get(&d, cfg, "head_dim"), 0);
+        const int qkv = 2 * Hk * Dk + Hv * Dv;
+        const int hcH = hc * hidden;
+        const int qsa = nheads * hd * 2;
+        if (qkv > big) big = qkv;
+        if (hcH > big) big = hcH;
+        if (qsa > big) big = qsa;
+    }
     const int wide = hidden > lat ? hidden : lat;
     int lut_wide = wide > moe_inter ? wide : moe_inter;
     const int T = WASTE_CHUNK_MAX;
@@ -483,8 +535,11 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         const int n_exp = (int)js_int(&d, js_get(&d, cfg, "num_experts"), 0);
         uint64_t att = (uint64_t)ctx_tokens * (uint64_t)nheads;
         const uint64_t kda = (uint64_t)kh * (uint64_t)kd;
+        const uint64_t gdn = (uint64_t)js_int(&d, js_get(&d, cfg, "linear_num_value_heads"), 0) *
+                             (uint64_t)js_int(&d, js_get(&d, cfg, "linear_key_head_dim"), 0);
         const uint64_t route = WASTE_ATT_ROUTER_OFF + 2ull * (uint64_t)n_exp;
         if (kda > att) att = kda;
+        if (gdn > att) att = gdn;
         if (route > att) att = route;
         sc += (att + 1024) * 4;
     }
@@ -539,11 +594,16 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
          * up, accumulator and down LUT per routed expert, because k threads
          * each run a whole expert. Read here rather than at the bottom of
          * this function, where top_k is fetched for the cache floor. */
-        const uint64_t k = (uint64_t)js_int(&d, js_get(&d, cfg,
-                                            "num_experts_per_token"), 8);
-        sc += k * ((uint64_t)2 * moe_inter + lat) * 4;      /* xga/xub/xacc */
-        sc += k * lut * 4;                                  /* m->xlut  */
-        sc += k * (lut + nsc * 4);                          /* xlut8/xqs */
+        /* The converter normalises this key, but a hand-written manifest
+         * may spell it the way HF does; fall back to that before the
+         * historical default rather than planning for the wrong count. */
+        uint64_t kt = (uint64_t)js_int(&d, js_get(&d, cfg,
+                                       "num_experts_per_token"), 0);
+        if (!kt) kt = (uint64_t)js_int(&d, js_get(&d, cfg,
+                                       "num_experts_per_tok"), 8);
+        sc += kt * ((uint64_t)2 * moe_inter + lat) * 4;     /* xga/xub/xacc */
+        sc += kt * lut * 4;                                 /* m->xlut  */
+        sc += kt * (lut + nsc * 4);                         /* xlut8/xqs */
     }
     sc += ((uint64_t)T * (2 * moe_inter * n_shared_eff + hidden) + 64) * 4;
     sc += (uint64_t)T * (2 * lat + 2 * hidden) * 4;
@@ -551,10 +611,38 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += (uint64_t)3 * moe_inter * lat * 4;                /* one expert      */
     sc += (uint64_t)T * nb * hidden * 4 + (uint64_t)T * hidden * 4;
     sc += (uint64_t)T * 64 * 12;    /* croute + crw + cused */
+    if (is_qwen) {
+        const int pe = (int)js_int(&d, js_get(&d, cfg, "ple_embed_dim"), hidden);
+        const int Hd = (int)js_int(&d, js_get(&d, cfg, "head_dim"), 0);
+        const int nkv = (int)js_int(&d, js_get(&d, cfg, "num_key_value_heads"), 0);
+        const int idim = (int)js_int(&d, js_get(&d, cfg, "indexer_head_dim"), 128);
+        const int compress = (int)js_int(&d, js_get(&d, cfg, "indexer_compress_ratio"), 4);
+        const int budget = (int)js_int(&d, js_get(&d, cfg, "indexer_budget"), 2048);
+        const int Hv = (int)js_int(&d, js_get(&d, cfg, "linear_num_value_heads"), 0);
+        const int n_exp = (int)js_int(&d, js_get(&d, cfg, "num_experts"), 0);
+        const int nblk = compress > 0
+            ? (int)((ctx_tokens + (uint32_t)compress - 1u) / (uint32_t)compress) : 0;
+        const int max_sel = budget + compress;
+        const int rot = (int)(Hd * js_num(&d, js_get(&d,
+            js_get(&d, cfg, "rope_parameters"), "partial_rotary_factor"),
+            js_num(&d, js_get(&d, cfg, "partial_rotary_factor"), 0.25)));
+        sc += (uint64_t)(pe > 0 ? pe : hidden) * 4u;
+        sc += (uint64_t)(Hv > 0 ? Hv : 1) * 4u;
+        sc += (uint64_t)nheads * Hd * 3u * 4u;
+        sc += (uint64_t)max_sel * nkv * Hd * 2u * 4u;
+        sc += (uint64_t)max_sel * 4u;
+        sc += (uint64_t)max_sel * 4u;
+        sc += ((uint64_t)nblk * idim + (uint64_t)nblk + (uint64_t)idim) * 4u;
+        sc += (uint64_t)nblk * 4u;
+        sc += 2ull * ctx_tokens * (uint64_t)(rot > 0 ? rot : 1) * 4u;
+        sc += (uint64_t)(n_exp > 0 ? n_exp : 1) * 5u;
+    }
     out->scratch_bytes = sc;
 
     /* one layer's top-k experts, double buffered */
-    const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
+    int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 0);
+    if (!top_k)
+        top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_tok"), 8);
     const int lyr = js_get(&d, 0, "layers");
     uint64_t rec = 0, bank_total = 0;
     if (js_size(&d, lyr) > 0) {
@@ -795,6 +883,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     if (c->tok) {
         waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
         waste_tok_set_han_split(c->tok, c->m.cfg.tok_han_split);
+        waste_tok_set_digit_run(c->tok, c->m.cfg.tok_digit_run);
     }
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, c->usage);
@@ -1329,6 +1418,7 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
     out->arch = strstr(cf->arch, "KimiK3")     ? "kimi-k3"
               : strstr(cf->arch, "KimiLinear") ? "kimi-linear"
               : strstr(cf->arch, "Glm5Next")   ? "glm5-next"
+              : strstr(cf->arch, "Qwen4Exp")   ? "qwen4_exp_text"
               : cf->arch[0]                    ? cf->arch
                                                : "unknown";
     out->quant_summary = c->quant;

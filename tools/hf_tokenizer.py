@@ -48,13 +48,33 @@ import json
 import os
 import sys
 
-# The pattern src/tokenizer.c implements, minus the Han branch that only the
-# Kimi models carry. Compared literally: a release that reorders one
+# The patterns src/tokenizer.c implements, spelled out rather than parsed.
+# Three things vary across this family and nothing else does, so the whole
+# set is enumerated and compared literally: a release that reorders one
 # alternative is a release this splits differently, and the difference does
 # not show up as an error.
-PAT_NO_HAN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|"
-              r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
-PAT_HAN = r"[\p{Han}]+|" + PAT_NO_HAN
+#
+#   han     — `[\p{Han}]+` as its own leading branch (both Kimi releases)
+#             or Han left to the letter branch (GLM, Qwen).
+#   marks   — `[\p{L}\p{M}]` (Qwen) or `\p{L}` (Kimi, GLM). Descriptive
+#             only: tokenizer.c's letter class is the union either way, so
+#             the two spellings are the same engine behaviour.
+#   digits  — `\p{N}{1,3}` (Kimi, GLM) or `\p{N}` (Qwen). NOT cosmetic;
+#             it is carried to the engine as `tokenizer_digit_run`.
+def _pattern(han, marks, digit_run):
+    letter = r"[\p{L}\p{M}]" if marks else r"\p{L}"
+    other = r"[^\s\p{L}\p{M}\p{N}]" if marks else r"[^\s\p{L}\p{N}]"
+    return ((r"[\p{Han}]+|" if han else "") +
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?" + letter +
+            r"+|\p{N}" + (r"{1,3}" if digit_run == 3 else "") +
+            r"| ?" + other + r"+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+
+
+# pattern -> (han_split, digit_run)
+KNOWN_PATTERNS = {_pattern(h, m, d): (h, d)
+                  for h in (0, 1) for m in (0, 1) for d in (1, 3)}
+PAT_NO_HAN = _pattern(0, 0, 3)
+PAT_HAN = _pattern(1, 0, 3)
 
 
 def bytes_to_unicode():
@@ -90,7 +110,7 @@ def split_pattern(tok):
 
 
 def convert(src, quiet=False):
-    """Returns (rank-file text, han_split, specials list)."""
+    """Returns (rank-file text, han_split, specials list, digit_run)."""
     path = os.path.join(src, "tokenizer.json")
     with io.open(path, encoding="utf-8") as f:
         tok = json.load(f)
@@ -105,16 +125,15 @@ def convert(src, quiet=False):
                          "src/tokenizer.c reads the byte-level form")
 
     pat = split_pattern(tok)
-    if pat == PAT_HAN:
-        han = True
-    elif pat == PAT_NO_HAN:
-        han = False
-    else:
+    if pat not in KNOWN_PATTERNS:
         raise SystemExit(
             "this release pre-tokenizes with a pattern src/tokenizer.c does "
             "not implement, and the difference would be silent:\n"
-            f"  release: {pat}\n  engine : {PAT_NO_HAN}\n"
-            "(optionally preceded by [\\p{Han}]+). See tools/hf_tokenizer.py.")
+            f"  release: {pat}\n"
+            + "".join(f"  known  : {k}\n" for k in KNOWN_PATTERNS)
+            + "See tools/hf_tokenizer.py.")
+    han, digit_run = KNOWN_PATTERNS[pat]
+    han = bool(han)
 
     dec = bytes_to_unicode()
     vocab = model["vocab"]
@@ -160,8 +179,9 @@ def convert(src, quiet=False):
         key=lambda e: e["id"])
     if not quiet:
         print(f"tokenizer: {len(lines)} merges, {len(specials)} specials, "
-              f"pattern {'with' if han else 'without'} a Han branch")
-    return "\n".join(lines) + "\n", han, specials
+              f"pattern {'with' if han else 'without'} a Han branch, "
+              f"up to {digit_run} digit(s) per piece")
+    return "\n".join(lines) + "\n", han, specials, digit_run
 
 
 def main():
@@ -176,7 +196,7 @@ def main():
     if os.path.exists(dst) and not args.force:
         print(f"{dst} exists; --force to replace it", file=sys.stderr)
         return 1
-    text, han, specials = convert(args.src)
+    text, han, specials, digit_run = convert(args.src)
     os.makedirs(args.out, exist_ok=True)
     with io.open(dst, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
@@ -185,7 +205,9 @@ def main():
                      encoding="utf-8", newline="\n") as f:
             json.dump(specials, f, indent=1)
     print(f"wrote {dst}"
-          + ("" if han else "  (tokenizer_han_split must be false)"))
+          + ("" if han else "  (tokenizer_han_split must be false)")
+          + ("" if digit_run == 3 else
+             f"  (tokenizer_digit_run must be {digit_run})"))
     return 0
 
 
