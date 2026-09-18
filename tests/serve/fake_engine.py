@@ -86,6 +86,11 @@ class FakeEngine:
     fail_with: Optional[Exception] = None
     # Sleep this long before each token, to test client disconnects.
     delay: float = 0.0
+    # What a fresh container answers without being asked. Serve-level code
+    # only reads this to report it (GET /v1/models) and to compare it
+    # against a request's reasoning_effort, so a boolean stands in for the
+    # real engine's reasoning_effort floor.
+    default_thinking: bool = True
 
     prompts: list[list[int]] = field(default_factory=list)
     calls: list[dict] = field(default_factory=list)

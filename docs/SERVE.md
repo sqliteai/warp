@@ -268,7 +268,8 @@ transcribed in this repo. That is what is left of
 | endpoint | notes |
 |---|---|
 | `GET /health` | liveness; never requires the API key |
-| `GET /v1/models`, `GET /v1/models/{id}` | reports the container's real shape under a `waste` key |
+| `GET /v1/models`, `GET /v1/models/{id}` | the registry: the loaded model (its real shape under a `waste` key), plus any registered-but-not-loaded containers with `"loaded": false` |
+| `POST /v1/models/load` | swap models; see "Swapping models" below |
 | `POST /v1/chat/completions` | streaming and not, tools, images |
 | `POST /v1/completions` | raw continuation, no chat template |
 
@@ -317,6 +318,55 @@ generation, so the image queue cannot be crossed between requests either.
 one lock, and requests queue. On a model streaming experts off an SSD at a
 few tokens a second, the wait for the lock is small next to the wait for
 the answer.
+
+### Swapping models
+
+By default the process serves the one container it was started with, and a
+request naming any other model is a 404 — before the registry existed any
+name was silently served by the loaded model, which made `model` a
+decorative string.
+
+`--models PATH[=ID]` (repeatable) registers additional containers a client
+may switch to:
+
+    python3 -m serve ~/models/k3.waste \
+        --models ~/models/glm53.waste --models ~/models/deepseek41.waste=ds41
+
+    curl localhost:8000/v1/models                 # the registry, with
+                                                  # "loaded" per entry
+    curl localhost:8000/v1/models/load \
+        -d '{"model":"glm53"}'                    # swap, then answer
+
+What a swap does:
+
+- It waits for the engine lock, so a generation in flight finishes before
+  the model moves under it.
+- It opens the new container, re-derives everything the container decides —
+  reply format, markers, stop tokens, the thinking default, `/v1/models`'s
+  shape — and only then **unloads the previous model** (`waste_close`).
+  One model resident at a time is the default, and the flag to change it
+  is `--keep-previous`.
+- The new container is opened before the old one is unloaded, so a swap
+  that fails — a truncated container, an `--exclusive-open` conflict —
+  leaves the server serving what it was serving and answers 500 with the
+  engine's own reason. The cost of that guarantee is a moment where both
+  containers are resident; size `--budget` so that moment fits.
+- Generation always serves the current model. A request naming a
+  registered-but-not-loaded model is a 409, telling the client to
+  `POST /v1/models/load` first, rather than an unnoticed multi-gigabyte
+  swap in the middle of a conversation. A request with no model, or
+  naming the current one, is untouched — which is every client that does
+  not know about the registry.
+- A swap discards the previous model's KV state. That is inherent:
+  `waste_close` frees the context. An agent harness should treat a swap
+  as rare and expensive, not as a per-turn choice.
+
+`--keep-previous` keeps the replaced model resident instead of unloading
+it. Switching back to it is then a slot move rather than a reopen — its
+`waste_ctx` and the state it holds are still there. The RAM two resident
+contexts need is the sum of their budgets; on the machines this engine
+targets that is usually the difference between working and paging, which
+is why unloading is the default.
 
 Streaming is written straight from the token callback, on the thread
 holding the lock. A client hanging up propagates back as a return value the
@@ -379,6 +429,20 @@ message and on each SSE delta. A client that does not know that field shows
 nothing while the model reasons — which, on a model whose reasoning can be
 most of the reply, looks like a server that has stopped. `--no-thinking`
 makes the default answer-only, and a request can still ask for reasoning.
+
+## Request log
+
+With request logging on (the default; `--no-log-requests` turns it off),
+each response line names the model it concerns:
+
+```
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -  [model=glm53]
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 409 -  [model=tiny]
+```
+
+A success line names the model that served it, a 409 or 404 names the
+model that was refused, and a `/v1/models/load` line names the model it
+switched to. GET lines carry no model annotation.
 
 ## Security
 
@@ -444,5 +508,11 @@ python3 -m serve MODEL [options]
   --max-tokens N     default cap when a request does not set one (4096)
   --no-thinking      answer without the think channel unless asked
   --allow-local-images
+  --models PATH[=ID] additional containers a client may switch to with
+                     POST /v1/models/load (repeatable; switching unloads
+                     the model it replaces)
+  --keep-previous    keep the replaced model resident instead of unloading
+                     it; RAM needed is then the sum of both budgets
   --plan             print the memory plan and exit
+  --no-log-requests  silence the per-request log lines
 ```

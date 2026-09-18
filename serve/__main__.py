@@ -26,9 +26,33 @@ from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      WASTE_E_ARG, WASTE_E_BUSY, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
                      plan_memory)
-from .server import serve                                    # noqa: E402
+from .server import ModelLoadError, serve                       # noqa: E402
 
 POLICIES = {"lfru": CACHE_LFRU, "lru": CACHE_LRU}
+
+
+def parse_registry(specs: list[str]) -> dict[str, str]:
+    """--models entries as {id: path}.
+
+    `PATH[=ID]`, ID defaulting to the file name without .waste — the
+    same default --model-id uses. Duplicate ids are an error rather than
+    a quiet overwrite: two containers behind one name means a client's
+    "load this model" sometimes loads a different one than it just
+    listed, and that failure announces itself only under load.
+    """
+    registry: dict[str, str] = {}
+    for spec in specs:
+        path, _, custom = spec.partition("=")
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise SystemExit(f"--models: no such container: {p}")
+        mid = custom or p.name.removesuffix(".waste")
+        if mid in registry:
+            raise SystemExit(
+                f"--models: duplicate model id: {mid} (both "
+                f"{registry[mid]} and {p})")
+        registry[mid] = str(p)
+    return registry
 
 
 def human(n: float) -> str:
@@ -82,6 +106,11 @@ examples:
 
   curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \\
     -d '{"model":"waste","messages":[{"role":"user","content":"hi"}]}'
+
+  python3 -m serve ~/models/k3.waste --models ~/models/glm53.waste \\
+        --models ~/models/deepseek41.waste=ds41
+        # POST /v1/models/load {"model":"glm53"} swaps to it, unloading k3;
+        # add --keep-previous to hold both resident instead
 """)
     ap.add_argument("model", help="path to the .waste container")
     ap.add_argument("--host", default="127.0.0.1",
@@ -140,8 +169,28 @@ examples:
                    help="let requests name images by filesystem path. Off by "
                         "default: it lets any client read files the server "
                         "can reach")
+    s.add_argument("--models", action="append", default=[], metavar="PATH[=ID]",
+                   help="an additional container a client may switch to "
+                        "with POST /v1/models/load (repeatable; id defaults "
+                        "to the file name without .waste). Switching "
+                        "unloads the model it replaces unless "
+                        "--keep-previous")
+    s.add_argument("--keep-previous", action="store_true",
+                   help="keep a model resident when another is loaded. "
+                        "Off by default, and deliberately: the RAM two "
+                        "contexts need together is the sum of their "
+                        "budgets, and on the machines this engine targets "
+                        "that is the difference between working and "
+                        "paging. Both models can then answer at once — "
+                        "each waste_ctx takes one caller, so each has its "
+                        "own lock")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
+    s.add_argument("--no-log-requests", action="store_true",
+                   help="silence the per-request log lines. On by default: "
+                        "each line names the model that served or was "
+                        "refused — on a server that swaps models, the log "
+                        "is how you find out which one answered")
 
     args = ap.parse_args(argv)
 
@@ -217,7 +266,22 @@ examples:
                     api_key=args.api_key,
                     default_max_tokens=args.max_tokens,
                     default_thinking=not args.no_thinking,
-                    allow_local_images=args.allow_local_images)
+                    allow_local_images=args.allow_local_images,
+                    log_requests=not args.no_log_requests,
+                    models=parse_registry(args.models),
+                    keep_previous=args.keep_previous,
+                    engine_kwargs={
+                        "ram_budget_bytes": args.budget,
+                        "ctx_tokens": args.ctx,
+                        "n_threads": args.threads,
+                        "cpu_list": args.cpus,
+                        "cache_policy": POLICIES[args.cache],
+                        "direct_io": not args.no_direct_io,
+                        "vision": args.vision,
+                        "verify_records": args.verify,
+                        "usage_path": args.usage,
+                        "exclusive_open": args.exclusive_open,
+                    })
     except (EngineError, OSError) as e:
         engine.close()
         print(f"{e}", file=sys.stderr)
@@ -272,7 +336,7 @@ examples:
     finally:
         srv.shutdown()
         srv.server_close()
-        engine.close()
+        srv.close_engines()
         shutil.rmtree(srv.tmpdir, ignore_errors=True)
     return 0
 

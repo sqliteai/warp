@@ -558,9 +558,16 @@ def engine_extra(stats: dict, *, ms: float) -> dict:
     }
 
 
-def model_object(model_id: str, created: int, info: Optional[dict] = None) -> dict:
+def model_object(model_id: str, created: int, info: Optional[dict] = None,
+                 loaded: Optional[bool] = None) -> dict:
     obj = {"id": model_id, "object": "model", "created": created,
            "owned_by": "waste"}
+    # Not an OpenAI field. A registry of swappable containers needs to say
+    # which of them is resident; without a marker the client would have to
+    # infer it from which entry carries a `waste` shape, which is worse
+    # than spelling it.
+    if loaded is not None:
+        obj["loaded"] = loaded
     if info:
         obj["waste"] = info
     return obj

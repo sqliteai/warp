@@ -17,7 +17,9 @@ a tool call to assert about.
 """
 
 import json
+import contextlib
 import http.client
+import io
 import shutil
 import socket
 import sys
@@ -35,6 +37,7 @@ from serve import xtml                                      # noqa: E402
 from serve.engine import EngineError, WASTE_E_IO            # noqa: E402
 from serve.server import serve                              # noqa: E402
 from tests.serve.fake_engine import (FakeEngine, LINEAR_MARKERS,  # noqa: E402
+                                     MARKERS,                     # noqa: E402
                                      reply_plain, reply_tool_call)
 
 
@@ -43,11 +46,13 @@ class ServerTestCase(unittest.TestCase):
 
     engine_kwargs: dict = {}
     server_kwargs: dict = {}
+    log_requests = False
 
     def setUp(self):
         self.engine = FakeEngine(**self.engine_kwargs)
         self.server = serve(self.engine, host="127.0.0.1", port=0,
-                            model_id="test-model", log_requests=False,
+                            model_id="test-model",
+                            log_requests=self.log_requests,
                             **self.server_kwargs)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever,
@@ -404,9 +409,18 @@ class TestStreaming(ServerTestCase):
 
 class TestValidation(ServerTestCase):
     def test_missing_messages(self):
-        status, body = self.post("/v1/chat/completions", {"model": "m"})
+        status, body = self.post("/v1/chat/completions", {})
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["param"], "messages")
+
+    def test_unknown_model_outranks_missing_messages(self):
+        # The model is validated before the request's shape, the way the
+        # OpenAI API does: a client pointed at a model this server does
+        # not serve should hear "no such model", not a complaint about
+        # messages it would have sent correctly to the right server.
+        status, body = self.post("/v1/chat/completions", {"model": "m"})
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["param"], "model")
 
     def test_empty_messages(self):
         status, body = self.post("/v1/chat/completions", {"messages": []})
@@ -817,6 +831,313 @@ class TestAuth(ServerTestCase):
         self.assertEqual(response.getheader("Connection"), "close")
         response.read()
         conn.close()
+
+
+class TestRequestLogs(ServerTestCase):
+    """The request log names the model, even when it refused one.
+
+    log_message runs on the server thread and writes sys.stderr at write
+    time, so redirecting it around the whole test captures the lines; each
+    is written before the response is flushed, so by the time the client
+    has the body the line is already in the buffer.
+    """
+
+    log_requests = True
+
+    def make_engine(self, path: str) -> FakeEngine:
+        return FakeEngine(model_path=path, markers=MARKERS)
+
+    def setUp(self):
+        self._captured = io.StringIO()
+        self._ctx = contextlib.redirect_stderr(self._captured)
+        self._ctx.__enter__()
+        try:
+            self.engine_kwargs = {"model_path": "/fake/start.waste"}
+            self.server_kwargs = {
+                "models": {"swap-a": "/fake/a.waste"},
+                "engine_factory": self.make_engine,
+            }
+            ServerTestCase.setUp(self)
+        except BaseException:
+            self._ctx.__exit__(None, None, None)
+            raise
+
+    def tearDown(self):
+        try:
+            ServerTestCase.tearDown(self)
+        finally:
+            self._ctx.__exit__(None, None, None)
+
+    def logs(self) -> str:
+        self._captured.flush()
+        return self._captured.getvalue()
+
+    def test_chat_log_names_the_serving_model(self):
+        status, _ = self.post("/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 200)
+        self.assertIn('"POST /v1/chat/completions HTTP/1.1" 200 -'
+                      "  [model=test-model]", self.logs())
+
+    def test_chat_log_names_a_named_model(self):
+        status, _ = self.post("/v1/chat/completions",
+                              {"model": "test-model",
+                               "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 200)
+        self.assertIn("[model=test-model]", self.logs())
+
+    def test_chat_log_names_the_model_a_409_refused(self):
+        status, _ = self.post("/v1/chat/completions",
+                              {"model": "swap-a",
+                               "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 409)
+        self.assertIn('"POST /v1/chat/completions HTTP/1.1" 409 -'
+                      "  [model=swap-a]", self.logs())
+
+    def test_chat_log_names_the_model_a_404_refused(self):
+        status, _ = self.post("/v1/chat/completions",
+                              {"model": "nope",
+                               "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 404)
+        self.assertIn("[model=nope]", self.logs())
+
+    def test_load_log_names_the_model_loaded(self):
+        status, _ = self.post("/v1/models/load", {"model": "swap-a"})
+        self.assertEqual(status, 200)
+        self.assertIn('"POST /v1/models/load HTTP/1.1" 200 -'
+                      "  [model=swap-a]", self.logs())
+
+    def test_get_log_carries_no_model(self):
+        status, _ = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertNotIn("[model=", self.logs())
+
+
+class TestModelSwap(ServerTestCase):
+    """POST /v1/models/load and the model field a generation request names.
+
+    The registry holds scripted engines; the engine_factory builds one per
+    container path, which is what the real server's default factory does
+    with the real Engine.
+    """
+
+    keep = False
+
+    def make_engine(self, path: str) -> FakeEngine:
+        engine = FakeEngine(model_path=path, markers=self.swap_markers,
+                            **self.factory_kwargs)
+        self.made.append(engine)
+        return engine
+
+    def setUp(self):
+        self.swap_markers = dict(MARKERS)
+        self.factory_kwargs = {}
+        self.made = []
+        self.engine_kwargs = {"model_path": "/fake/start.waste"}
+        self.server_kwargs = {
+            "models": {"swap-a": "/fake/a.waste", "swap-b": "/fake/b.waste"},
+            "keep_previous": self.keep,
+            "engine_factory": self.make_engine,
+        }
+        ServerTestCase.setUp(self)
+
+    def load(self, model):
+        return self.post("/v1/models/load", {"model": model})
+
+    def test_load_switches_and_unloads_previous(self):
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "swap-a")
+        self.assertEqual(body["previous"], "test-model")
+        self.assertEqual(self.made[0].model_path, "/fake/a.waste")
+        # One model resident at a time: the startup engine is closed and
+        # dropped, and the swap target is what every endpoint reports.
+        self.assertTrue(self.engine.closed)
+        self.assertEqual(self.server.model_id, "swap-a")
+        self.assertEqual(self.server.engine, self.made[0])
+        self.assertEqual(list(self.server.engines), ["swap-a"])
+
+    def test_load_unknown_model_404s(self):
+        status, body = self.load("nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["type"], "not_found_error")
+        self.assertEqual(self.server.model_id, "test-model")
+
+    def test_load_current_model_is_a_noop(self):
+        status, body = self.load("test-model")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["previous"], None)
+        self.assertEqual(self.made, [])          # no engine was built
+        self.assertEqual(self.server.model_id, "test-model")
+
+    def test_models_lists_registry_with_loaded_flags(self):
+        status, body = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        by_id = {m["id"]: m for m in body["data"]}
+        self.assertEqual(by_id["test-model"]["loaded"], True)
+        self.assertEqual(by_id["swap-a"]["loaded"], False)
+        self.assertNotIn("waste", by_id["swap-a"])   # not opened: no shape
+        self.assertIn("waste", by_id["test-model"])
+        # The current model first, so a client scanning the list sees what
+        # is resident before what is only available.
+        self.assertEqual(body["data"][0]["id"], "test-model")
+
+    def test_registered_model_entry_says_not_loaded(self):
+        status, body = self.get("/v1/models/swap-b")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["id"], "swap-b")
+        self.assertEqual(body["loaded"], False)
+
+    def test_generation_rejects_registered_but_not_loaded(self):
+        status, body = self.chat(model="swap-b")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "model_not_loaded")
+
+    def test_generation_rejects_unknown_model(self):
+        status, body = self.chat(model="nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["type"], "not_found_error")
+
+    def test_generation_accepts_loaded_model_after_swap(self):
+        status, _ = self.load("swap-a")
+        self.assertEqual(status, 200)
+        self.made[0].reply = reply_plain("from a")
+        status, body = self.chat(model="swap-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "swap-a")
+        self.assertEqual(body["choices"][0]["message"]["content"], "from a")
+
+    def test_generation_without_model_still_served_after_swap(self):
+        """A client that never names a model must survive a swap it did
+        not ask for — absent means 'whatever is loaded'. The helper's
+        default model name would 409 after a swap, so this omits it the
+        way a client that does not know about the registry does."""
+        self.load("swap-a")
+        self.made[0].reply = reply_plain("still there")
+        status, body = self.chat(model=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "swap-a")
+
+    def test_failed_open_leaves_previous_loaded(self):
+        def broken(path):
+            raise EngineError("open", WASTE_E_IO, path)
+
+        self.server.engine_factory = broken
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["type"], "engine_error")
+        self.assertEqual(self.server.model_id, "test-model")
+        # And it still serves: the rollback guarantee is the point.
+        self.engine.reply = reply_plain("unharmed")
+        status, body = self.chat()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], "unharmed")
+
+    def test_failed_open_leaves_registry_usable(self):
+        def broken(path):
+            raise EngineError("open", WASTE_E_IO, path)
+
+        self.server.engine_factory = broken
+        self.load("swap-a")
+        self.server.engine_factory = self.make_engine
+        status, body = self.load("swap-b")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["previous"], "test-model")
+
+    def test_per_container_facts_are_rebuilt(self):
+        """A container without XTML must not inherit the previous one's
+        reply format — the swap re-derives markers, format, stop tokens,
+        and the thinking default."""
+        self.swap_markers = {}                     # marker_ids() will raise
+        self.factory_kwargs = {"no_markers": True}
+        status, body = self.load("swap-a")
+        self.factory_kwargs = {}
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(self.server.chat_error)
+        # The refusal moves with the slot: the startup model could chat,
+        # the loaded one cannot.
+        status, body = self.chat(model=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "unsupported_chat_format")
+
+    def test_swap_waits_out_a_generation_in_flight(self):
+        """A swap takes the old engine's lock: the streaming request that
+        started first finishes whole, and the swap's close happens after,
+        not under it."""
+        self.engine.delay = 0.02
+        self.engine.reply = reply_plain("long answer")
+        events = []
+        errors = []
+
+        def streamer():
+            try:
+                events.extend(self.stream())
+            except Exception as e:                       # pragma: no cover
+                errors.append(e)
+
+        t = threading.Thread(target=streamer)
+        t.start()
+        t.join(timeout=0.1)      # started, not done
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 200)
+        t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(events[-1], "[DONE]")
+
+
+class TestModelSwapKeepPrevious(TestModelSwap):
+    """--keep-previous: the model a swap replaces stays resident."""
+
+    keep = True
+
+    def test_load_switches_and_unloads_previous(self):
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "swap-a")
+        self.assertEqual(self.server.model_id, "swap-a")
+        self.assertEqual(self.server.engine, self.made[0])
+
+    def test_previous_stays_open(self):
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 200)
+        self.assertFalse(self.engine.closed)
+        self.assertEqual(sorted(self.server.engines),
+                         ["swap-a", "test-model"])
+
+    def test_can_switch_back_without_reopening(self):
+        """swap-a was never closed, so loading it again is a slot move,
+        not a new open."""
+        self.load("swap-a")
+        self.load("test-model")
+        self.assertEqual(self.server.model_id, "test-model")
+        self.assertEqual(self.server.engine, self.engine)
+        self.assertEqual([e.model_path for e in self.made],
+                         ["/fake/a.waste"])
+
+    def test_both_engines_survive_parallel_traffic(self):
+        """Two resident contexts: nothing is refused, nothing is closed
+        mid-answer. Generation serves the current slot, so every request
+        names it — the point here is that the resident-but-idle engine
+        does not interfere and is not touched."""
+        self.load("swap-a")
+        self.made[0].reply = reply_plain("from a")
+        results = []
+        lock = threading.Lock()
+
+        def one():
+            status, body = self.chat(model="swap-a")
+            with lock:
+                results.append(status)
+
+        threads = [threading.Thread(target=one) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(len(results), 3)
+        for status in results:
+            self.assertEqual(status, 200)
+        self.assertFalse(self.engine.closed)
 
 
 class TestConcurrency(ServerTestCase):
