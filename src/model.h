@@ -458,6 +458,14 @@ typedef struct {
      * counter are the only things it writes. Everything else it touches —
      * the bank table, the expert shapes, `verify` — is fixed at load. */
     pthread_mutex_t fetch_mu;
+    /* The trunk kernel is per-model, not per-process. A Qwen load used to
+     * write the file-static default, so a Kimi context already open in the
+     * same process silently switched to i8mm arithmetic mid-session
+     * (sqliteai/warp#68). These two carry the choice with the model that
+     * made it; the file-static values remain the process default that a
+     * fresh load inherits. */
+    int    trunk_kern;                /* TK_* for this model              */
+    int    sdot4_sg;                  /* TK_SDOT activations per int8 scale */
 } waste_model;
 
 /* Everything the load needs that is not in the container. These are
@@ -499,6 +507,11 @@ void        waste_model_reset(waste_model *m);
 int         waste_model_resize_cache(waste_model *m, size_t cache_bytes);
 void        waste_model_set_lookahead(int n);
 void        waste_model_set_sdot4(int on, int sg);
+/* Per-model form of the above: sets the kernel for `m` alone and leaves
+ * every other open model untouched. Callers that want to sweep kernel arms
+ * on one model must use this — the global form only moves the default that
+ * subsequent loads inherit. */
+void        waste_model_set_kernel(waste_model *m, int mode, int sg);
 void        waste_model_set_device_min_kb(long kb);
 void        waste_model_set_metal_moe(int on);
 void        waste_model_set_vq8(int on);

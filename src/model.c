@@ -943,20 +943,21 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
     const int mc = mv_chunk(out, t->rowbytes);
-    if (trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
+    const int tk = m->trunk_kern, sg4 = m->sdot4_sg;
+    if (tk != TK_F32 && t->bits == 4 && (g & 31) == 0) {
         mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
-                       in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
+                       in, ng, g, sg4, g / sg4, t->rowbytes };
         waste_range_fn fn = NULL;
         const double tq0 = prof_on ? pnow() : 0;
-        if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
-            quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
+        if (tk == TK_SDOT && g % sg4 == 0) {
+            quant_act4(x, in, g, sg4, m->xq, m->xs);
             fn = mvq4_rows_sdot;
 #if defined(__ARM_NEON) || defined(__aarch64__)
-        } else if (trunk_kern == TK_I8MM) {
+        } else if (tk == TK_I8MM) {
             quant_act4_mm(x, in, g, m->xq, m->xs);
             fn = waste_mvq4_rows_i8mm;
 #endif
-        } else if (trunk_kern == TK_SMLAL) {
+        } else if (tk == TK_SMLAL) {
             quant_act4_16(x, in, g, m->xq, m->xs);
             fn = mvq4_rows_smlal;
         }
@@ -1040,7 +1041,7 @@ static void matvec_t_batch(waste_model *m, const float *x, int in,
                            const mvb_item *it, int n)
 {
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    const int shared = trunk_kern == TK_I8MM && !trunk_check && n > 1 &&
+    const int shared = m->trunk_kern == TK_I8MM && !trunk_check && n > 1 &&
                        n <= MVB_MAX && it[0].t && it[0].t->q;
     const int g = shared ? it[0].t->group : 0;
     mvb_arg a;
@@ -1053,7 +1054,8 @@ static void matvec_t_batch(waste_model *m, const float *x, int in,
         if (shared && t && t->q && t->bits == 4 && t->group == g && (g & 31) == 0) {
             const int k = a.n++;
             a.a[k] = (mvq4_arg){ it[i].y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
-                                 in, (in + g - 1) / g, g, sdot4_sg, g / sdot4_sg,
+                                 in, (in + g - 1) / g, g, m->sdot4_sg,
+                                 g / m->sdot4_sg,
                                  t->rowbytes };
             a.mc[k] = mv_chunk(it[i].out, t->rowbytes);
             a.out[k] = it[i].out;
@@ -1096,13 +1098,13 @@ static void matvec_t_batch(waste_model *m, const float *x, int in,
  * the projection. `prequant_ok` says whether `t` reads planes laid out that
  * way: i8mm, four bits, a group the kernel takes, and `span` — the size of
  * the caller's pieces — a whole number of groups. */
-static int prequant_ok(const waste_tensor *t, int span)
+static int prequant_ok(const waste_model *m, const waste_tensor *t, int span)
 {
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    return t && t->q && trunk_kern == TK_I8MM && !trunk_check && t->bits == 4 &&
+    return t && t->q && m->trunk_kern == TK_I8MM && !trunk_check && t->bits == 4 &&
            t->group > 0 && (t->group & 31) == 0 && span % t->group == 0;
 #else
-    (void)t; (void)span;
+    (void)m; (void)t; (void)span;
     return 0;
 #endif
 }
@@ -1114,7 +1116,8 @@ static void matvec_t_prequant(waste_model *m, float *y, const waste_tensor *t,
     const double t0 = prof_on ? pnow() : 0;
     const int g = t->group;
     mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
-                   in, (in + g - 1) / g, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
+                   in, (in + g - 1) / g, g, m->sdot4_sg, g / m->sdot4_sg,
+                   t->rowbytes };
     waste_parallel_for_work(out, mv_chunk(out, t->rowbytes), waste_mvq4_rows_i8mm, &a,
                             (size_t)out * t->rowbytes);
     if (prof_on) {
@@ -2694,8 +2697,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
      * (LEARNED §83). The kernel is one setting for the whole process, so a
      * process that loads Qwen and then another architecture keeps i8mm for
      * both; the variable pins it either way. */
+    m->trunk_kern = trunk_kern;
+    m->sdot4_sg   = sdot4_sg;
     if (m->cfg.arch_qwen && !trunk_kern_env)
-        waste_model_set_sdot4(TK_I8MM, sdot4_sg);
+        waste_model_set_kernel(m, TK_I8MM, m->sdot4_sg);
     /* rope_init leaves no table for a shape it does not implement. Running
      * anyway would apply no rotation, which is not a degraded result but an
      * unordered one, so refuse instead. */
@@ -6303,14 +6308,30 @@ void waste_model_set_lookahead(int n) { lookahead_n = n < 0 ? 0 : n; }
 /* For tests/sweep.c: the SDOT trunk path is chosen once from the
  * environment, and an arm has to be able to flip it inside one process —
  * two arms in two processes are two computers (docs/LEARNED.md §33). */
-void waste_model_set_sdot4(int mode, int sg)
+/* The same clamp both setters need: a kernel the CPU cannot run is not an
+ * error, it degrades to one it can. */
+static int kern_clamp(int mode)
 {
     const uint32_t f = waste_cpu_features();
     if ((mode == TK_SDOT || mode == TK_I8MM) && !(f & WASTE_CPU_DOTPROD)) mode = TK_F32;
     if (mode == TK_I8MM && !(f & WASTE_CPU_I8MM)) mode = TK_SMLAL;
     if (mode < 0 || mode > TK_SMLAL) mode = TK_F32;
-    trunk_kern = mode;
+    return mode;
+}
+
+/* Process default, inherited by subsequent loads. It deliberately does not
+ * reach into models already open — that reach was #68. */
+void waste_model_set_sdot4(int mode, int sg)
+{
+    trunk_kern = kern_clamp(mode);
     if (sg == 32 || sg == 64 || sg == 128) sdot4_sg = sg;
+}
+
+void waste_model_set_kernel(waste_model *m, int mode, int sg)
+{
+    if (!m) return;
+    m->trunk_kern = kern_clamp(mode);
+    if (sg == 32 || sg == 64 || sg == 128) m->sdot4_sg = sg;
 }
 /* For tests/sweep.c: the size above which a matvec goes to the device.
  * 0 sends everything, a very large value sends nothing — which is how one
@@ -7638,7 +7659,7 @@ static void qwen_hc_mix_t(waste_model *m, float *hyper,
     float *normed = m->tmp;
     float *lo = normed + H;
     float *gate = lo + rank;
-    const int pq = prequant_ok(down, hid);
+    const int pq = prequant_ok(m, down, hid);
     {
         hcn_arg na = { normed, hyper, nw->data, hid, c->eps,
                        cblock, inj_prev, pq ? down->group : 0, H, m->xq, m->xs };
@@ -7892,7 +7913,7 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
     if (Dv <= GDN_SCRATCH && tnw && tnw->data) {
         /* `normed` is `mixed`: in_proj_qkv's output, which nothing reads
          * after the conv, so the heads can write it while they run. */
-        const int pq = prequant_ok(top, Dv);
+        const int pq = prequant_ok(m, top, Dv);
         gdnf_arg fa = { { Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core },
                         z, tnw->data, c->eps, mixed,
                         pq ? top->group : 0, Hv * Dv, m->xq, m->xs };
