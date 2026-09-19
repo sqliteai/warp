@@ -19,6 +19,13 @@
 
 #include "ecache.h"
 #include "tokenizer.h"
+#include "waste_backend.h"
+
+/* Which kernel the Q4G trunk matvec uses. Public so callers (tests,
+ * benchmarks) can compare a model's trunk_kern against the CPU-clamped
+ * expectation rather than a literal; see src/model.c for what each mode
+ * costs in accuracy. */
+enum { TK_F32 = 0, TK_SDOT = 1, TK_I8MM = 2, TK_SMLAL = 3 };
 
 /* Public image requests are decoded before resize.  Keep the source-image
  * allocation finite so the memory planner can include its true worst case. */

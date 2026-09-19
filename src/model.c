@@ -208,11 +208,11 @@ static inline float dotf(const float *a, const float *b, int n)
 
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
-/* Which kernel the Q4G trunk matvec uses. The trunk is 28.0 GB of Q4G on
- * K3 and every byte is read once per token, so this one choice is ~46% of
- * a decode step (docs/EXP1.md §1). See model_opts_init for what each mode
- * costs in accuracy. */
-enum { TK_F32 = 0, TK_SDOT = 1, TK_I8MM = 2, TK_SMLAL = 3 };
+/* TK_F32/TK_SDOT/TK_I8MM/TK_SMLAL are now declared in model.h (public,
+ * so tests can compare against the CPU-clamped expectation). The trunk
+ * is 28.0 GB of Q4G on K3 and every byte is read once per token, so this
+ * one choice is ~46% of a decode step (docs/EXP1.md §1). See
+ * model_opts_init for what each mode costs in accuracy. */
 static int trunk_kern = TK_F32;   /* WASTE_TRUNK_KERNEL                   */
 static int trunk_kern_env = 0;    /* set explicitly; waste_model_load     */
 static int sdot4_sg = 32;  /* TK_SDOT only: activations per int8 scale    */
@@ -2694,9 +2694,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
      * K3 kind that a recurrence carries forward: against f32 over 5,918
      * tokens of real text, perplexity 3.712 against 3.698, no growth past
      * QSA's 2,048-token selection budget, for 7.57 -> 9.59 tok/s
-     * (LEARNED §83). The kernel is one setting for the whole process, so a
-     * process that loads Qwen and then another architecture keeps i8mm for
-     * both; the variable pins it either way. */
+     * (LEARNED §83). The kernel is per-model (sqliteai/warp#68): a model
+     * already open when a Qwen container loads keeps whichever kernel it
+     * started with, and only this new model gets i8mm. */
     m->trunk_kern = trunk_kern;
     m->sdot4_sg   = sdot4_sg;
     if (m->cfg.arch_qwen && !trunk_kern_env)

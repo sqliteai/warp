@@ -1695,17 +1695,24 @@ else
         no "QSA block pooling is wrong (3 tok: '$q3'; 4 tok: '$q4')"
     fi
 
-    # Chunked prefill against sequential decode, the check that has caught
-    # every state bug in this engine: the two share no code above the layer
-    # loop and must agree bit for bit.
     # A Qwen load picks the i8mm trunk kernel. That choice must stay on the
     # model that made it: a non-Qwen context already open in this process
     # keeps its own kernel and its own logits (#68).
-    if ./test_kernel_isolation "$MODEL" "$QWENC" >"$TMP/kiso.log" 2>&1; then
+    WASTE_CACHE_MB=512 ./test_kernel_isolation "$MODEL" "$QWENC" >"$TMP/kiso.log" 2>&1
+    kiso_rc=$?
+    if [ "$kiso_rc" -eq 0 ]; then
         ok "a Qwen load leaves an open non-Qwen model's kernel and logits alone"
+    elif [ "$kiso_rc" -eq 2 ]; then
+        sk "a Qwen load leaves an open non-Qwen model's kernel and logits alone" \
+           "$(tail -1 "$TMP/kiso.log")"
     else
         no "a Qwen load leaves an open non-Qwen model's kernel and logits alone"
+        tail -5 "$TMP/kiso.log"
     fi
+
+    # Chunked prefill against sequential decode, the check that has caught
+    # every state bug in this engine: the two share no code above the layer
+    # loop and must agree bit for bit.
 
     WASTE_CHUNK=1 ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_chunk.bin" 0 \
         >/dev/null 2>&1
