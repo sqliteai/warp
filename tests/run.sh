@@ -1695,9 +1695,52 @@ else
         no "QSA block pooling is wrong (3 tok: '$q3'; 4 tok: '$q4')"
     fi
 
+    # A Qwen load picks the i8mm trunk kernel. That choice must stay on the
+    # model that made it: a non-Qwen context already open in this process
+    # keeps its own kernel and its own logits (#68).
+    WASTE_CACHE_MB=512 ./test_kernel_isolation "$MODEL" "$QWENC" >"$TMP/kiso.log" 2>&1
+    kiso_rc=$?
+    if [ "$kiso_rc" -eq 0 ]; then
+        ok "a Qwen load leaves an open non-Qwen model's kernel and logits alone"
+    elif [ "$kiso_rc" -eq 2 ]; then
+        sk "a Qwen load leaves an open non-Qwen model's kernel and logits alone" \
+           "$(tail -1 "$TMP/kiso.log")"
+    else
+        no "a Qwen load leaves an open non-Qwen model's kernel and logits alone"
+        tail -5 "$TMP/kiso.log"
+    fi
+
+    # kernel_kl is only meaningful if the two arms really are two kernels.
+    # When it set the kernel process-wide, the second load overwrote the
+    # first and it compared a kernel against itself: KL came out exactly
+    # 0.00e+00, which reads as "the kernels agree perfectly" — a passing
+    # number for a tool that had stopped measuring anything. A zero here is
+    # therefore not a strong result, it is the signature of that bug.
+    #
+    # Gated on kiso_rc 0, which is exactly the condition "this CPU selected
+    # TK_I8MM", i.e. a second kernel exists to compare against. On a CPU
+    # without i8mm, kern_clamp() folds k2 onto another arm and a zero would
+    # be honest rather than broken.
+    if [ "$kiso_rc" -eq 0 ] && [ -x ./kernel_kl ]; then
+        printf '3 7 11 5 9 13 2 17 4 8 19 23 6 29 12 31\n' >"$TMP/kkl_ids.txt"
+        kkl=$(./kernel_kl "$QWENC" "$TMP/kkl_ids.txt" 0 0 2 2>&1 | grep '^everything')
+        kkl_mean=$(printf '%s' "$kkl" | sed -n 's/.*KL mean \([0-9.e+-]*\).*/\1/p')
+        # Any nonzero mean is enough: the arms are distinct. The magnitude
+        # is fixture-dependent and deliberately not asserted.
+        if [ -n "$kkl_mean" ] && awk -v v="$kkl_mean" 'BEGIN{exit !(v+0>0)}'; then
+            ok "kernel_kl compares two distinct kernels (KL mean $kkl_mean)"
+        else
+            no "kernel_kl reported KL mean '$kkl_mean' between k0 and k2 — a zero means both arms ran the same kernel, not that the kernels agree (#68)"
+            printf '%s\n' "$kkl"
+        fi
+    elif [ "$kiso_rc" -eq 0 ]; then
+        sk "kernel_kl compares two distinct kernels" "kernel_kl not built"
+    fi
+
     # Chunked prefill against sequential decode, the check that has caught
     # every state bug in this engine: the two share no code above the layer
     # loop and must agree bit for bit.
+
     WASTE_CHUNK=1 ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_chunk.bin" 0 \
         >/dev/null 2>&1
     if [ ! -s "$TMP/qwen_chunk.bin" ]; then
