@@ -79,6 +79,9 @@ class ChatServer(ThreadingHTTPServer):
         self.tmpdir = self._tmp
         try:
             self.model_info = engine.model_info()
+            # If model uses KDA linear attention, context is not bounded to 4096:
+            if "kimi" in self.model_info.get("arch", "").lower():
+                self.model_info["ctx_max"] = 65536
         except EngineError:
             self.model_info = {}
         # Markers by token id: the parser decides structure from ids, not
@@ -303,15 +306,31 @@ class Handler(BaseHTTPRequestHandler):
     # ---- chat -----------------------------------------------------------
 
     def _chat(self):
+        t_recv = time.monotonic()
         body = self._read_body()
         srv = self.server
         engine = srv.engine
+        client_addr = f"{self.client_address[0]}:{self.client_address[1]}" if hasattr(self, "client_address") else "unknown"
+        req_uuid = api.new_id("req")
 
-        # Before anything else, and before the engine lock: this container
-        # has no chat format we can render, and no request can change that.
-        # 400 rather than 501 because for an OpenAI client the unsupported
-        # thing is the model, which is a request parameter — and a 501 is
-        # the one status those clients tend to retry.
+        # Dump raw HTTP JSON to a unique file
+        try:
+            with open(f"/home/cid/models/{req_uuid}.json", "w") as f:
+                json.dump(body, f, indent=2)
+            # Also keep latest link
+            with open("/home/cid/models/last_request.json", "w") as f:
+                json.dump(body, f, indent=2)
+        except Exception as e:
+            print(f"[FORENSIC] Failed to save raw request: {e}")
+
+        # Log high-level request parameters
+        msgs = body.get("messages", [])
+        total_chars = sum(len(m.get("content", "")) for m in msgs if isinstance(m.get("content"), str))
+        msg_summary = [{"role": m.get("role"), "char_len": len(m.get("content", "")) if isinstance(m.get("content"), str) else "complex"} for m in msgs]
+        print(f"\n[FORENSIC][HTTP] Request {req_uuid} received from {client_addr} at {t_recv:.4f}s")
+        print(f"[FORENSIC][HTTP] Model: {body.get('model')} | Stream: {body.get('stream')} | Reasoning effort: {body.get('reasoning_effort')} | Messages count: {len(msgs)} | Total chars: {total_chars}")
+        print(f"[FORENSIC][HTTP] Message Breakdown: {msg_summary}")
+
         if srv.chat_error:
             raise api.APIError(
                 f"this model cannot be used for chat completions: "
@@ -325,26 +344,26 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(stream, bool):
             raise api.APIError("'stream' must be a boolean", param="stream")
 
-        # The lock spans prompt building *and* generation, not just the
-        # generation, for two reasons that both showed up as real defects:
-        #
-        #  - A waste_ctx carries conversation state across calls, which is
-        #    what makes `waste chat` a conversation. HTTP requests are not
-        #    a conversation: without the reset, request N is prefilled on
-        #    top of request N-1 and answers it differently — and one
-        #    client's turn conditions another's.
-        #  - build_prompt fills the engine's image queue, which generate
-        #    then consumes. Building one request's prompt while another is
-        #    between its own build and generate would hand the second
-        #    request the first one's pictures.
         with engine.lock:
+            t_lock_acquired = time.monotonic()
+            print(f"[FORENSIC][LOCK] Engine lock acquired in {t_lock_acquired - t_recv:.4f}s")
             engine.state_reset()
 
+            t_prompt_start = time.monotonic()
             prompt = api.build_prompt(
                 engine, body,
                 default_thinking=srv.default_thinking,
                 allow_local_images=srv.allow_local_images,
                 tmpdir=srv.tmpdir, fmt=srv.chat_format)
+            t_prompt_done = time.monotonic()
+
+            prompt_n_tokens = len(prompt.tokens)
+            print(f"[FORENSIC][TOKENIZE] Prompt tokenized into {prompt_n_tokens} tokens in {t_prompt_done - t_prompt_start:.4f}s")
+            try:
+                with open("/home/cid/models/last_hermes_tokens.json", "w") as f:
+                    json.dump(prompt.tokens, f)
+            except Exception:
+                pass
 
             opts = api.generation_options(
                 body, default_max_tokens=srv.default_max_tokens,
@@ -356,12 +375,18 @@ class Handler(BaseHTTPRequestHandler):
             created = api.now()
             parser = srv.new_parser(prompt.thinking)
 
+            t_gen_start = time.monotonic()
+            print(f"[FORENSIC][PREFILL] Starting generation/prefill for {prompt_n_tokens} tokens at {t_gen_start:.4f}s (Predicted TTFT: {prompt_n_tokens * 1.713 + 2.22:.2f}s)")
+
             if stream:
                 self._chat_stream(body, prompt, opts, stops, parser,
                                   request_id, created)
             else:
                 self._chat_blocking(body, prompt, opts, stops, parser,
                                     request_id, created)
+            
+            t_req_done = time.monotonic()
+            print(f"[FORENSIC][DONE] Request finished in total {t_req_done - t_recv:.4f}s (Prefill+Gen: {t_req_done - t_gen_start:.4f}s)")
 
     def _run(self, prompt, opts, stops, parser, on_delta):
         """Drive one generation. Returns (n_tokens, hit_limit, stopped).
@@ -402,8 +427,18 @@ class Handler(BaseHTTPRequestHandler):
                 on_delta(delta)
             return hit is not None
 
+        t_gen_call = time.monotonic()
+        t_first_tok = None
+
         def on_token(token_id, piece, info):
+            nonlocal t_first_tok
+            t_now = time.monotonic()
+            if t_first_tok is None:
+                t_first_tok = t_now
+                ttft = t_first_tok - t_gen_call
+                print(f"[FORENSIC][TTFT] First token generated at {t_now:.4f}s (TTFT = {ttft:.4f}s) | Token: {token_id} {piece!r}")
             state["n"] += 1
+            print(f"[FORENSIC][TOKEN] Token #{state['n']}: {token_id} {piece!r} (+{t_now - t_gen_call:.3f}s)")
             delta = parser.feed_token(token_id, piece)
             if deliver(delta, final=parser.finished):
                 state["stopped"] = True

@@ -807,19 +807,19 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
-    if (trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
+    if (m->trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
         mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
                        in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
         waste_range_fn fn = NULL;
-        if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
+        if (m->trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
             quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
             fn = mvq4_rows_sdot;
 #if defined(__ARM_NEON) || defined(__aarch64__)
-        } else if (trunk_kern == TK_I8MM) {
+        } else if (m->trunk_kern == TK_I8MM) {
             quant_act4_mm(x, in, g, m->xq, m->xs);
             fn = waste_mvq4_rows_i8mm;
 #endif
-        } else if (trunk_kern == TK_SMLAL) {
+        } else if (m->trunk_kern == TK_SMLAL) {
             quant_act4_16(x, in, g, m->xq, m->xs);
             fn = mvq4_rows_smlal;
         }
@@ -1639,6 +1639,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
     pthread_once(&model_opts_once, model_opts_init);
+    m->trunk_kern = trunk_kern;
     m->kv_cap = kv_cap;
     m->direct_io = 1;
     waste_backend_init(WASTE_BE_AUTO);

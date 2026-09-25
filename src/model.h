@@ -294,6 +294,7 @@ typedef struct {
      * counter are the only things it writes. Everything else it touches —
      * the bank table, the expert shapes, `verify` — is fixed at load. */
     pthread_mutex_t fetch_mu;
+    int      trunk_kern;             /* resolved WASTE_TRUNK_KERNEL         */
 } waste_model;
 
 /* Everything the load needs that is not in the container. These are

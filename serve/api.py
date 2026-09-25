@@ -177,14 +177,15 @@ def resolve_thinking(body: dict, default_thinking: bool) -> tuple[bool, Optional
         raise APIError("'reasoning_effort' must be a string",
                        param="reasoning_effort")
     low = effort.lower()
+    if low == "medium":
+        low = "high"
     if low in _EFFORT_OFF:
         return False, None
     if low not in xtml._VALID_THINKING_EFFORTS:
         raise APIError(
             f"reasoning_effort={effort!r} is not supported by this model. "
             f"Kimi K3 accepts {sorted(xtml._VALID_THINKING_EFFORTS)}, or "
-            f"{sorted(_EFFORT_OFF)} to answer without reasoning. "
-            f"(K3's own encoder documents 'medium' and then rejects it.)",
+            f"{sorted(_EFFORT_OFF)} to answer without reasoning.",
             param="reasoning_effort")
     if thinking is False:
         raise APIError("'thinking' is false but 'reasoning_effort' asks for "

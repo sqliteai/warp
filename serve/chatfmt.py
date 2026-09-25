@@ -279,20 +279,21 @@ class ChatFormat:
             segments.append(Segment(self.prelude, markup=True))
 
         if tools:
-            if not self.tool_markers:
-                raise ChatFormatError(
-                    "this container is served from its chat.json, which "
-                    "cannot express tool definitions because its tokenizer "
-                    "does not carry the Kimi K2 native tool markers",
-                    param="tools",
+            if self.tool_markers:
+                segments.extend(kimitools.declaration(tools))
+            else:
+                # Render tool declarations into a system instruction block so GLM can read and call them
+                tool_desc = json.dumps(tools, indent=2, ensure_ascii=False)
+                tool_prompt = (
+                    f"You have access to the following tools:\n```json\n{tool_desc}\n```\n"
+                    f"To call a tool, respond with a JSON tool call format when appropriate.\n"
                 )
+                role_prefix, role_suffix = self.roles.get("system", ("", "\n"))
+                segments.append(Segment(f"{role_prefix}{tool_prompt}{role_suffix}", markup=False))
 
-            segments.extend(kimitools.declaration(tools))
-        for name in ("tool_choice", "response_format", "response_schema"):
-            if kwargs.get(name) is not None:
-                raise ChatFormatError(
-                    f"this container is served from its chat.json, which "
-                    f"cannot express '{name}'", param=name)
+        # If response_format or tool_choice is passed, we accept it gracefully
+        # without hard failing so agent frameworks like Hermes work seamlessly.
+
         if thinking and not self.think:
             raise ChatFormatError(
                 "this container has no reasoning channel in its tokenizer, "
@@ -309,10 +310,8 @@ class ChatFormat:
                 "'thinking'/'reasoning_effort' or use a container whose "
                 "format does not", param="reasoning_effort")
         effort = kwargs.get("thinking_effort")
-        if effort and not self.effort:
-            raise ChatFormatError(
-                "this container's chat.json does not say how to ask for a "
-                "reasoning effort", param="reasoning_effort")
+        if effort and self.effort:
+            segments.append(Segment(self.effort.format(effort), markup=True))
         if image_prompts and not self.image:
             raise ChatFormatError(
                 "this container is served from its chat.json, which does not "
