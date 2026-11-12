@@ -235,6 +235,36 @@ else
     exit 1
 fi
 
+# The version is spelled twice in src/waste.h: three numeric macros and a
+# string, and nothing compared them. 0.8.2 bumped WASTE_VERSION_PATCH and
+# left WASTE_VERSION_STRING at "0.8.1", so `waste --version`, the server's
+# banner and the line at the top of this very run would all have said 0.8.1
+# on a 0.8.2 build — src/version.c reads the string — and the whole suite
+# stayed green, because nothing here reads a version at all. It is one grep.
+v_major=$(sed -n 's/^#define WASTE_VERSION_MAJOR *\([0-9][0-9]*\).*/\1/p' src/waste.h)
+v_minor=$(sed -n 's/^#define WASTE_VERSION_MINOR *\([0-9][0-9]*\).*/\1/p' src/waste.h)
+v_patch=$(sed -n 's/^#define WASTE_VERSION_PATCH *\([0-9][0-9]*\).*/\1/p' src/waste.h)
+v_str=$(sed -n 's/^#define WASTE_VERSION_STRING *"\([^"]*\)".*/\1/p' src/waste.h)
+v_want="$v_major.$v_minor.$v_patch"
+if [ -z "$v_major" ] || [ -z "$v_minor" ] || [ -z "$v_patch" ] || [ -z "$v_str" ]; then
+    no "src/waste.h version macros could not be read (got '$v_want' and '$v_str')"
+elif [ "$v_str" = "$v_want" ]; then
+    ok "WASTE_VERSION_STRING agrees with the numeric macros ($v_want)"
+else
+    no "WASTE_VERSION_STRING is \"$v_str\" but the macros say $v_want"
+fi
+
+# And the rule in CLAUDE.md: the changelog is written in the commit that
+# bumps the version, not in a later one. A release whose changelog lands
+# afterwards is a release nobody can read from the outside.
+if [ ! -f CHANGELOG.md ]; then
+    no "CHANGELOG.md is missing"
+elif grep -q "^## $v_want" CHANGELOG.md; then
+    ok "CHANGELOG.md has a section for $v_want"
+else
+    no "CHANGELOG.md has no '## $v_want' section; the changelog is written in the commit that bumps the version"
+fi
+
 head_ "model-container ownership"
 # This intentionally opens two contexts at once. Always give it a tiny
 # dedicated container rather than duplicating a caller-supplied K3 load.

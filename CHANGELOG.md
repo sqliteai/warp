@@ -8,6 +8,165 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.8.2 — 2026-11-12
+
+**The server can hold a swappable set of containers** — contributed by
+@hendrikras in #74 — and **the trunk kernel is a property of a model
+rather than of the process**, by @mfethe1 in #75, which closes #68.
+
+Both were re-measured on this commit rather than taken on trust. With a
+Kimi-Linear container: 110 passed, 0 failed, 6 skipped, the serve suite at
+417 checks (from 319), and `make asan` clean with no sanitizer report,
+100 passed against 0.8.1's 96. Line for line, against 0.8.1 both runs
+differ by the same four added checks — #75's two and the two version
+greps below — and the serve suite's own count. Nothing else moved.
+
+The registry was additionally driven over a real socket against real
+weights — two containers behind one port, and a second pair of two
+different architectures — for the swap ordering, the refusals, and the
+per-container facts a swap re-derives.
+
+No ABI move: `src/waste.h` changes only its version macros.
+
+### Added
+
+- **A model registry behind a stable route name**, so the container a
+  route name resolves to can change without reconfiguring clients.
+  `--models PATH[=ID]` (repeatable) registers what may be switched to;
+  `POST /v1/models/load` switches; `GET /v1/models` lists the registry
+  with a `loaded` flag per entry. `loaded` means **residency**, the same
+  set the load response reports: with `--keep-previous` a model the server
+  has swapped away from but still holds an open `waste_ctx` for answers
+  `loaded: true`, and switching back to it is a slot move rather than a
+  reopen of a multi-gigabyte container.
+
+  A generation naming a model the registry does not know is a **404**, and
+  one it knows but has not loaded is a **409** pointing at the load
+  endpoint — not a surprise multi-gigabyte swap in the middle of a
+  conversation. That strictness follows the operator's opt-in (`--models`,
+  or `--auto-register`) and not the number of ids the registry happens to
+  hold, which with `--auto-register` is something any client can change.
+  **A server started without either flag is unchanged**: absent, the
+  container's own id, or any other string all serve, including the fixed
+  name most OpenAI clients are configured with and the `"model": "waste"`
+  example in `serve --help`.
+
+  A swap opens the new container *before* closing the old one, which is
+  the opposite of what a tight-RAM machine would prefer and is the point:
+  a failed open leaves the server serving the model it was serving. It
+  happens under the current engine's lock, so a generation in flight
+  finishes first, and a request that queued behind it finds the slot moved
+  and answers 409 rather than generating on a closed container. Everything
+  a container decides — reply format, markers, stop tokens, the thinking
+  default, the shape `GET /v1/models` reports — moves in a single
+  assignment, so no request can see one model's `waste_ctx` with another
+  model's format.
+
+  `--auto-register` lets `POST /v1/models/load` register a container by
+  pathname it has not seen before. Off by default, for the reason
+  `--allow-local-images` is: a client that can reach the port could
+  otherwise make the server open an arbitrary file on it. `--usage` cannot
+  be combined with either flag — a learned hotlist is specific to one
+  container. Request log lines name the model that served or was refused,
+  and `--no-log-requests` silences them. See docs/SERVE.md, "Swapping
+  models".
+
+- **A swap has to prove it fits, and a load that would not is a 507.** A
+  swap opens the new container before closing the old one — the order that
+  makes a failed open leave the server serving what it was serving — so
+  two contexts are resident at once. Documenting that and leaving the
+  operator to size `--budget` for it would have been worse than "the sum
+  of the two": with `--budget 0` each context sizes itself to as much as
+  3/4 of `waste_usable_ram()`, so a swap would run at ~1.5x what the
+  process may use — a paging run, not a slow one.
+
+  So `--models` requires an explicit `--budget`, and the server refuses
+  to start unless `2 x budget` fits, naming the largest budget that does;
+  the same lines are printed under the startup banner and by `--plan`,
+  which is where a budget gets chosen. At runtime the resident set is
+  counted at every load — each engine's budget, or the floor and expert
+  cache `waste_memory_used` reports for one that chose its own — and a
+  load that would not fit is refused with **507**
+  (`insufficient_memory`) *before* the container is opened: nothing is
+  closed, nothing is half-loaded, the previous model keeps serving, and
+  the message says what it needed next to what was already held. 507
+  rather than 503 because asking again cannot help.
+
+  That is also what bounds `--keep-previous`, whose resident set grows
+  with every model ever switched to and which no startup check can price
+  in advance: the cap is derived from the budgets rather than from a
+  separate `--max-resident` count that could disagree with them, and a
+  slot move to a model that is already resident is never refused because
+  it allocates nothing. Evicting a resident model to make room was the
+  alternative and is not done — changing what is resident behind a
+  client's back is the failure `--keep-previous` exists to prevent.
+
+  A load that arrives with no `--budget` at all — the single-container
+  default, and the path an `--auto-register`ed container takes — is priced
+  from the container's own plan at its **floor**, the least it can run
+  with, rather than at `recommended_bytes`: the engine sizes its expert
+  cache down on a tighter machine instead of refusing to open, so pricing
+  at the recommended figure would have refused a load it would have taken
+  fine.
+
+  `serve/` goes to 179 server tests plus a new `tests/serve/test_main.py`
+  of 14, for the arithmetic on its own.
+
+- **`tests/run.sh` checks that the version is spelled consistently, and
+  that the changelog was written in the same commit.** `src/waste.h`
+  spells the version twice — three numeric macros and
+  `WASTE_VERSION_STRING`, which `src/version.c` is what every banner
+  prints — and nothing compared them. Bumping the macros for this release
+  and leaving the string behind made `waste --version`, the server's
+  banner and the header of the suite's own output all say 0.8.1 on a 0.8.2
+  build, with every check still green, because nothing in the suite read a
+  version at all. Two greps now: the string against the macros, and a
+  `## <version>` section in `CHANGELOG.md` against the same figure, which
+  is the rule CLAUDE.md states and the one this release had to go back and
+  apply by hand.
+
+### Fixed
+
+- **A Qwen load no longer moves a model already open onto i8mm** (#68,
+  #75). `trunk_kern` and `sdot4_sg` were file-statics that
+  `matvec_t_inner`, `matvec_t_batch` and `prequant_ok` read for every
+  4-bit trunk tensor in the process, and 0.8.1 made a *container load*
+  write them: the right default for Qwen (LEARNED §83: 29% for a
+  difference the text cannot see) but applied process-wide. So a host that
+  opened a Kimi or GLM container and then a Qwen one moved the first
+  container's trunk onto i8mm as well, mid-generation, and the same prompt
+  through the same container gave different logits depending on what had
+  been opened earlier in the same process. i8mm is explicitly not the
+  exact arithmetic — that is what `WASTE_TRUNK_KERNEL=0` is for — so this
+  was a numerical change and nothing reported it.
+
+  Measured here before the fix, on two synthetic fixtures in one process:
+  **253 of 256 logits** of the already-open non-Qwen model moved, max abs
+  4.95e-05. The two controls that give that number meaning: a *second
+  non-Qwen* container as the thing loaded second moves 0 of 256, and so
+  does a Qwen container with `WASTE_TRUNK_KERNEL` pinned. After the fix,
+  0 of 256 in both load orders, while a Qwen container's own logits stay
+  **bit-identical** to `WASTE_TRUNK_KERNEL=2` — the isolation is not
+  bought by denying Qwen its kernel — and a real Kimi-Linear container is
+  byte-identical to 0.8.1. `tests/test_kernel_isolation.c` holds the
+  check the issue asked for, and SKIPs loudly rather than passing on a
+  CPU without i8mm or with the kernel pinned.
+
+  `waste_model_set_sdot4()` still sets the process default a fresh load
+  inherits; the new `waste_model_set_kernel(m, mode, sg)` retunes one
+  model. `tests/sweep.c` and `tests/kernel_kl.c` use it, which they have
+  to: both flip the kernel inside one process, and after the change the
+  process-wide setter no longer reaches a model already loaded, so
+  `kernel_kl` would have compared a kernel against itself and reported
+  `KL mean 0.00e+00` — a passing-looking number from a tool that had
+  stopped measuring. `tests/run.sh` now asserts that KL is nonzero for
+  exactly that reason.
+
+  This is also what **#70** was waiting for: the i8mm trunk kernel as
+  DeepSeek-V4.1's default, measured in 0.8.1 at 3.87–3.97 → 4.52–4.56
+  tok/s and held back only because a per-model default could not be kept
+  to its own model. It can be now.
+
 ## 0.8.1 — 2026-09-18
 
 **Qwen3.8-Flash-Next runs**, text only — contributed by @Skibisky in #63.
@@ -97,49 +256,6 @@ No ABI move: `src/waste.h` changes only its version macros.
 
 ### Fixed
 
-- **A no-`--budget` swap is now priced by the container's floor, not its
-  recommended figure.** The resident-set check prices a load that arrives
-  with no `--budget` — the single-container default, and the path an
-  `--auto-register`ed container takes — from the container's own plan, at
-  the floor: the least it can run with, which is the figure the engine
-  actually holds while it sizes its expert cache down. Pricing at the
-  recommended figure refused a load the engine would have opened fine;
-  `serve/server.py`'s `planned_budget` now returns the floor, and the
-  no-budget arithmetic in `tests/serve/test_server.py` pins it. A load
-  that fits the floor next to what is resident is served, not refused.
-
-- **`"loaded"` on `GET /v1/models` now means residency, as
-  `POST /v1/models/load` already said it did.** The registry listing set
-  `loaded: true` only for the model being served, so under
-  `--keep-previous` a model the server still holds an open `waste_ctx`
-  for was listed `loaded: false` — indistinguishable from a container
-  that was never opened — while the load response's `models` field
-  counted it as resident, and a generation naming it was refused as "not
-  loaded". The two endpoints now agree: `loaded` is `mid in engines`,
-  the same set the load response reports, and `GET /v1/models/{id}` says
-  the same for one entry. The 409 for a model that is resident but not
-  current says "resident but not the model being served" rather than
-  "registered but not loaded"; the `model_not_loaded` type and status
-  are unchanged. The `waste` shape still travels only on the current
-  entry — the per-model facts move with the current slot and are
-  re-derived when a swap makes a resident model current again. Tests in
-  `tests/serve/test_server.py`.
-
-- **A single-container server serves any model name again.** The model
-  registry made `check_model_request` strict for every deployment: with
-  no `--models`, the registry holds only the loaded model, so a request
-  naming anything else was a 404 — including the fixed name most OpenAI
-  clients are configured with and the `"model": "waste"` example in
-  `serve --help` itself, neither of which a client can easily change.
-  The server's own id defaults to the container's file name
-  (`k3.waste` → `k3`), so even the "correct" name was one most clients
-  did not know. What an existing deployment guaranteed was "any name is
-  answered by the one container"; that is restored: absent, the loaded
-  id, or any other string all serve. Strict validation — a 404 for a
-  name the registry does not know, a 409 for one it knows but has not
-  loaded — is what `--models` opts into, and is unchanged there. Tests
-  for both behaviours in `tests/serve/test_server.py`.
-
 - **DeepSeek-V4.1 without `--reclaim`: the Engram index was never
   written** (#71, #72 — found and fixed by @helenkwok converting the
   release on an EPYC 7713). Only the `--reclaim` path called
@@ -168,48 +284,6 @@ No ABI move: `src/waste.h` changes only its version macros.
 
 ### Measured and not adopted
 
-- **`--models` now has to prove its swap fits, and a load that would not
-  is a 507.** A swap opens the new container before closing the old one —
-  the order that makes a failed open leave the server serving what it was
-  serving — so two contexts are resident at once, and `docs/SERVE.md`
-  asked the operator to size `--budget` so that moment fits while nothing
-  checked. The default made it worse than "the sum of the two": with
-  `--budget 0` each context sizes itself to as much as 3/4 of
-  `waste_usable_ram()`, so a swap ran at ~1.5x what the process may use —
-  a paging run, not a slow one.
-
-  `--models` now requires an explicit `--budget`, and the server refuses
-  to start unless `2 x budget` fits, naming the largest budget that does;
-  the same lines are printed under the startup banner and by `--plan`,
-  which is where a budget gets chosen. At runtime the resident set is
-  counted at every load — each engine's budget, or the floor and expert
-  cache `waste_memory_used` reports for one that chose its own — and a
-  load that would not fit is refused with **507**
-  (`insufficient_memory`) *before* the container is opened: nothing is
-  closed, nothing is half-loaded, the previous model keeps serving, and
-  the message says what it needed next to what was already held. 507
-  rather than 503 because asking again cannot help.
-
-  That is also what bounds `--keep-previous`, whose resident set grows
-  with every model ever switched to and which no startup check can price
-  in advance: the cap is derived from the budgets rather than from a
-  separate `--max-resident` count that could disagree with them, and a
-  slot move to a model that is already resident is never refused because
-  it allocates nothing. Evicting a resident model to make room was the
-  alternative and is not done — changing what is resident behind a
-  client's back is the failure `--keep-previous` exists to prevent.
-
-  `serve/` goes to 144 server tests (from 135) plus a new
-  `tests/serve/test_main.py` of 12, for the arithmetic on its own.
-
-- **A strict CI job for the K2 tool protocol**, the one GLM has had and
-  which `ci.yml` used to have to exempt K2 from in so many words: "the same
-  ground-truth rule the K2 template check in tests/run.sh applies, except
-  this one may not skip". Now neither may. `CI_K2_ORACLE_STRICT=1` turns
-  every skip path — missing template, missing jinja2, unresolved markers —
-  into a failure, and the job asserts all **seven** checks ran, so it
-  cannot be green by having done nothing. Vendoring the template is what
-  made it possible: no download, no weights, no machine-local `~/models`.
 - **The i8mm trunk kernel as DeepSeek-V4.1's default.** 3.87–3.97 tok/s
   becomes 4.52–4.56. Of 2,080 routing decisions it flips one, a tie the
   reference itself cannot resolve, and the 201 others that differ all
