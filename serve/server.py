@@ -270,6 +270,16 @@ class ChatServer(ThreadingHTTPServer):
         # client that can reach this port could make the server open an
         # arbitrary file on its own filesystem.
         self.auto_register = auto_register
+        # Whether this server was told it has a swappable set — and so
+        # whether a generation naming an unknown model is a 404 rather than
+        # something the loaded model answers. It is the operator's opt-in,
+        # recorded once, not `len(self.registry)`: with auto_register any
+        # client can change that length by registering a path, so the same
+        # request would be answered by the loaded model before someone else's
+        # registration and 404'd after it. `--models` naming the container the
+        # server already serves collapses to one entry too (setdefault keeps
+        # the loaded path), which left --models given and nothing strict.
+        self.strict_models = bool(models) or auto_register
         self.engine_factory = engine_factory or self._default_engine_factory
         self._slot_lock = threading.RLock()
         # model_id -> the Engine holding it. With keep_previous there can be
@@ -333,9 +343,19 @@ class ChatServer(ThreadingHTTPServer):
         return self._slot.default_thinking
 
     def current_slot(self) -> ModelSlot:
-        """The current model's facts, as one consistent value."""
-        with self._slot_lock:
-            return self._slot
+        """The current model's facts, as one consistent value.
+
+        Deliberately lock-free. The slot moves only by whole-object
+        assignment in `_detect`, so one attribute read is already the
+        consistent snapshot the lock was there to give: a reader sees the
+        old slot or the new one, never a mix. Taking `_slot_lock` here
+        would be worse than useless — `load_model` holds it across the
+        new container's open, so a `GET /health` or `GET /v1/models`
+        arriving mid-load would wait out a multi-gigabyte read before it
+        could answer liveness. Writers still take the lock, which is what
+        serialises two swaps against each other.
+        """
+        return self._slot
 
     def check_engine(self, slot: ModelSlot) -> ModelSlot:
         """Call with slot.engine.lock held, after acquiring it: is this
@@ -393,20 +413,23 @@ class ChatServer(ThreadingHTTPServer):
         conversation — the client asks for that explicitly with
         POST /v1/models/load.
 
-        Without `--models` the registry holds only the loaded model, and
-        nothing here rejects anything: a single-container server has no
-        swappable set to defend, its id defaults to the container's file
-        name, and clients — including the example in `serve --help` —
-        send a fixed model name they cannot easily change. Validating
-        every name would 404 deployments that answered them yesterday;
-        strict validation is what `--models` opts into.
+        Without `--models` or `--auto-register` the registry holds only the
+        loaded model, and nothing here rejects anything: a single-container
+        server has no swappable set to defend, its id defaults to the
+        container's file name, and clients — including the example in
+        `serve --help` — send a fixed model name they cannot easily change.
+        Validating every name would 404 deployments that answered them
+        yesterday; strict validation is what those two flags opt into, and
+        it follows the flags rather than how many ids the registry holds
+        (see `strict_models`).
         """
         mid = body.get("model")
         if not isinstance(mid, str) or not mid or mid == self.model_id:
             return
-        # No --models, no registry to be strict about: the only entry is
-        # the loaded model itself, so anything named is served by it.
-        if len(self.registry) < 2:
+        # No swappable set was asked for, so there is nothing to be strict
+        # about: the only entry is the loaded model itself, and anything
+        # named is served by it.
+        if not self.strict_models:
             return
         if mid not in self.registry:
             raise api.APIError(f"no such model: {mid}", status=404,
@@ -856,7 +879,7 @@ class Handler(BaseHTTPRequestHandler):
         from . import engine as engine_mod
         self._send_json(200, {
             "status": "ok",
-            "model": self.server.model_id,
+            "model": self.server.current_slot().model_id,
             "engine": engine_mod.build_info(),
             "uptime_s": api.now() - self.server.started,
         })
@@ -873,19 +896,23 @@ class Handler(BaseHTTPRequestHandler):
         # when a swap makes it current again. A registered-but-never-opened
         # container is loaded=false and carries no shape — its facts are
         # unknown until it is opened.
-        data = [api.model_object(srv.model_id, srv.started,
-                                 srv.model_info, loaded=True)]
+        # One slot for the whole listing: read per fact, a GET that overlaps
+        # a swap could name one model as current and carry the other's shape.
+        slot = srv.current_slot()
+        data = [api.model_object(slot.model_id, srv.started,
+                                 slot.model_info, loaded=True)]
         data += [api.model_object(mid, srv.started, None,
                                   loaded=mid in srv.engines)
                  for mid in sorted(srv.registry)
-                 if mid != srv.model_id]
+                 if mid != slot.model_id]
         self._send_json(200, {"object": "list", "data": data})
 
     def _model(self, model_id: str):
         srv = self.server
-        if model_id == srv.model_id:
+        slot = srv.current_slot()
+        if model_id == slot.model_id:
             self._send_json(200, api.model_object(model_id, srv.started,
-                                                  srv.model_info, loaded=True))
+                                                  slot.model_info, loaded=True))
             return
         if model_id not in srv.registry:
             raise api.APIError(f"no such model: {model_id}", status=404,

@@ -308,9 +308,13 @@ examples:
                         "naming an id the server has not seen is refused, and "
                         "a load carrying a path it has not seen is the way in; "
                         "the two are distinguishable, so the endpoint can say "
-                        "whether a path exists on this host. --usage cannot be "
-                        "combined with it: a learned hotlist is specific to one "
-                        "container")
+                        "whether a path exists on this host. Being an opt-in to "
+                        "switching, it is also an opt-in to the strict "
+                        "validation --models turns on: a generation naming a "
+                        "model this server does not know answers 404 rather "
+                        "than being served by whatever is loaded. --usage "
+                        "cannot be combined with it: a learned hotlist is "
+                        "specific to one container")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
     s.add_argument("--no-log-requests", action="store_true",

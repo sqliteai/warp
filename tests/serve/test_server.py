@@ -26,6 +26,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1467,6 +1468,133 @@ class TestSwapMemoryBudgetWithoutABudgetRefused(TestSwapMemoryBudgetWithoutABudg
         self.assertIn("5 B", message)           # the resident, measured
         self.assertIn("9 B", message)           # against what the machine has
         self.assertEqual(self.made, [])
+
+
+class TestAGetDoesNotWaitOutALoad(ServerTestCase):
+    """`load_model` holds `_slot_lock` across the new container's open, which
+    on the models this engine is for is seconds of disk, not milliseconds. A
+    read-only handler that took that lock would stop answering for the whole
+    load — a liveness probe that fails while a model is loading reads as a
+    dead server. So `current_slot()` is lock-free: the slot moves only by
+    whole-object assignment, and one read is already the snapshot.
+
+    The open is faked slow here rather than measured on a real container: a
+    4 GB trunk off this machine's NVMe opens in 0.36 s, which is too fast to
+    tell a wedge from a fast answer.
+    """
+
+    OPEN_S = 1.5
+
+    def slow_factory(self, path: str):
+        time.sleep(self.OPEN_S)
+        return FakeEngine(model_path=path, markers=dict(MARKERS))
+
+    def setUp(self):
+        self.engine_kwargs = {"model_path": "/fake/start.waste"}
+        self.server_kwargs = {
+            "models": {"slow": "/fake/slow.waste"},
+            "engine_factory": self.slow_factory,
+        }
+        ServerTestCase.setUp(self)
+
+    def test_health_and_models_answer_mid_load(self):
+        done = {}
+
+        def load():
+            done["load"] = self.post("/v1/models/load", {"model": "slow"})
+
+        t = threading.Thread(target=load, daemon=True)
+        t.start()
+        time.sleep(0.3)                       # inside the open
+        t0 = time.time()
+        h_status, _ = self.get("/health")
+        m_status, body = self.get("/v1/models")
+        elapsed = time.time() - t0
+        t.join(timeout=self.OPEN_S + 10)
+
+        self.assertEqual(h_status, 200)
+        self.assertEqual(m_status, 200)
+        # Generous by a long way, and still nowhere near the open: a handler
+        # that took _slot_lock would have waited out the rest of OPEN_S.
+        self.assertLess(elapsed, self.OPEN_S / 2)
+        # And the load it was racing did finish.
+        self.assertEqual(done["load"][0], 200)
+        self.assertEqual(done["load"][1]["loaded"], "slow")
+        # The listing taken mid-load named the model that was still current,
+        # with its own shape and not the incoming one's.
+        self.assertEqual(body["data"][0]["id"], "test-model")
+
+
+class TestStrictIsTheOptIn(ServerTestCase):
+    """Strict model validation follows the operator's opt-in, not the number
+    of ids the registry happens to hold.
+
+    `len(registry) < 2` was the first gate and it is not stable: with
+    --auto-register any client can change that length, so a generation
+    naming an unknown model was answered by the loaded model before
+    someone else's POST /v1/models/load and 404'd after it — the same
+    request, two answers, decided by another client's timing. And
+    --models naming the container the server already serves collapses to
+    one entry (`registry.setdefault` keeps the loaded path), which left
+    --models given, --budget required and checked, and nothing strict.
+    """
+
+    def server_for(self, **kwargs):
+        engine = FakeEngine(model_path="/fake/start.waste")
+        srv = serve(engine, host="127.0.0.1", port=0, model_id="test-model",
+                    log_requests=False, **kwargs)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        # Cleanups run last-registered first: stop the accept loop, close
+        # the socket, then wait for the thread.
+        self.addCleanup(t.join, 5)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        t.start()
+        return srv
+
+    def chat_on(self, srv, model):
+        port = srv.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps({"model": model,
+                             "messages": [{"role": "user", "content": "hi"}]}
+                            ).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_auto_register_alone_is_strict(self):
+        # One entry in the registry, and strict all the same: the flag is
+        # the opt-in, and it is on.
+        srv = self.server_for(auto_register=True)
+        self.assertEqual(list(srv.registry), ["test-model"])
+        status, body = self.chat_on(srv, "no-such-model")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["param"], "model")
+
+    def test_models_naming_the_loaded_container_is_strict(self):
+        # --models given, and the id it derives is the loaded model's own,
+        # so the registry still holds exactly one entry.
+        srv = self.server_for(models={"test-model": "/fake/start.waste"})
+        self.assertEqual(list(srv.registry), ["test-model"])
+        status, body = self.chat_on(srv, "no-such-model")
+        self.assertEqual(status, 404)
+
+    def test_neither_flag_is_not_strict(self):
+        # The case that must not change: a plain single-container server
+        # serves any name, including `serve --help`'s own "waste".
+        srv = self.server_for()
+        status, body = self.chat_on(srv, "waste")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "test-model")
+
+    def test_the_loaded_model_s_own_id_always_passes(self):
+        srv = self.server_for(auto_register=True)
+        status, body = self.chat_on(srv, "test-model")
+        self.assertEqual(status, 200)
 
 
 class TestAutoRegister(ServerTestCase):

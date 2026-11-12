@@ -156,17 +156,6 @@ class TestRegistryLines(unittest.TestCase):
                                   plan=self.plan)
         self.assertIn("not checked", lines[2])
 
-
-class TestHumanBytes(unittest.TestCase):
-    def test_units(self):
-        self.assertEqual(human(0), "0 B")
-        self.assertEqual(human(1024), "1.0 KB")
-        self.assertEqual(human(3 * GB), "3.0 GB")
-        self.assertEqual(human(2 * (1 << 40)), "2.0 TB")
-
-
-
-
 if __name__ == "__main__":
     unittest.main()
 

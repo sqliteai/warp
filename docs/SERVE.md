@@ -341,7 +341,8 @@ string before the registry existed.
     curl localhost:8000/v1/models/load \
         -d '{"model":"glm53"}'                    # swap, then answer
 
-`--auto-register` opts into the same switching without naming the set:
+`--auto-register` opts into the same switching, and the same strict
+validation, without naming the set:
 `POST /v1/models/load` may register a container by pathname it has not
 seen before, instead of refusing any id outside `--models`. Off by
 default — the same reason `--allow-local-images` is — because a client
@@ -352,6 +353,13 @@ own plan when none is set, and refused with 507 if it would not fit.
 `--usage` cannot be combined with either: a learned hotlist is specific
 to one container, and a caller that did not name one is not allowed to
 teach the server a hotlist for a container it has not opened.
+
+Strictness follows the flag, not the size of the registry. A server started
+with either flag answers 404 for a model it does not know, even while the
+registry holds a single entry — which is the case before the first
+`--auto-register` load, and the case when `--models` names the container the
+server is already serving. Otherwise the answer to the same request would
+depend on what another client registered a moment earlier.
 
 What a swap does:
 
