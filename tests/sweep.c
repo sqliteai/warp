@@ -189,7 +189,7 @@ int main(int argc, char **argv)
             } else if (is_dev) {
                 waste_model_set_device_min_kb(arm[a]);
             } else if (is_sdot4) {
-                waste_model_set_sdot4(arm[a], sdot4_sg_env);
+                waste_model_set_kernel(&m, arm[a], sdot4_sg_env);
             } else if (is_look) {
                 waste_model_set_lookahead(arm[a]);
             } else if (is_depth) {

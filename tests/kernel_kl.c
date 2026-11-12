@@ -217,12 +217,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "load failed\n");
         return 1;
     }
+    waste_model_set_kernel(ma, ka, sg);
     for (int i = 0; i < nb; i++) {
         mb[i] = (waste_model *)calloc(1, sizeof *mb[i]);
         if (!mb[i] || waste_model_load(mb[i], argv[1], kv, &lo)) {
             fprintf(stderr, "load failed\n");
             return 1;
         }
+        waste_model_set_kernel(mb[i], kb[i], sg);
     }
     const int V = ma->cfg.vocab, L = ma->cfg.n_layers, K = ma->cfg.top_k;
     float *A = (float *)malloc((size_t)V * sizeof(float));
@@ -241,13 +243,11 @@ int main(int argc, char **argv)
     t0 = now();
     for (int pos = 0; pos < n + n_gen; pos++) {
         const int tok = pos < n ? ids[pos] : cur;
-        waste_model_set_sdot4(ka, sg);
         const float *la = waste_model_step(ma, tok, pos, ra);
         if (!la) { fprintf(stderr, "kernel a step %d failed\n", pos); return 1; }
         memcpy(A, la, (size_t)V * sizeof(float));
         cur = argmax(A, V);
         for (int i = 0; i < nb; i++) {
-            waste_model_set_sdot4(kb[i], sg);
             const float *lb = waste_model_step(mb[i], tok, pos, rb);
             if (!lb) { fprintf(stderr, "kernel %d step %d failed\n", kb[i], pos); return 1; }
             score(A, lb, V, pos, pos + 1 < n ? ids[pos + 1] : -1, &w[i]);

@@ -261,7 +261,7 @@ waste$(EXE): cli/main.o libwaste.a
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
              test_qwenparts test_state test_vision test_vision_glm \
              test_vision_ds41 test_image test_memory test_cpus test_lock sweep \
-             kernel_kl test_qsa_pick test_qsa_attn
+             kernel_kl test_qsa_pick test_qsa_attn test_kernel_isolation
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -278,6 +278,9 @@ test_kda$(EXE): tests/test_kda.o libwaste.a
 # what says the two agree.
 test_container$(EXE): tests/test_container.o src/crc32.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_kernel_isolation$(EXE): tests/test_kernel_isolation.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 test_forward$(EXE): tests/test_forward.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
