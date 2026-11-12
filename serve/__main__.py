@@ -304,7 +304,13 @@ examples:
                         ".waste, or the caller's own 'model' if it gives "
                         "one; the load is still priced against --budget (or, "
                         "with none, the container's plan) and refused with "
-                        "507 if it would not fit")
+                        "507 if it would not fit. With the flag on, a load "
+                        "naming an id the server has not seen is refused, and "
+                        "a load carrying a path it has not seen is the way in; "
+                        "the two are distinguishable, so the endpoint can say "
+                        "whether a path exists on this host. --usage cannot be "
+                        "combined with it: a learned hotlist is specific to one "
+                        "container")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
     s.add_argument("--no-log-requests", action="store_true",
@@ -315,9 +321,9 @@ examples:
 
     args = ap.parse_args(argv)
 
-    if args.usage and args.models:
-        print("--usage cannot be used with --models: a learned hotlist is "
-              "specific to one container", file=sys.stderr)
+    if args.usage and (args.models or args.auto_register):
+        print("--usage cannot be used with --models or --auto-register: a "
+              "learned hotlist is specific to one container", file=sys.stderr)
         return 2
 
     model = Path(args.model).expanduser()

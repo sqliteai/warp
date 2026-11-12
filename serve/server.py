@@ -507,22 +507,31 @@ class ChatServer(ThreadingHTTPServer):
                    + used.get("min_expert_cache", 0))
 
     def planned_budget(self, path: str) -> int:
-        """What a container would ask for when no --budget is configured.
+        """What a container will hold when no --budget is configured.
 
-        A prediction, and named one. With 0 the engine walks its own ladder
-        — floor plus whole expert working sets, under 3/4 of usable RAM —
-        and nothing here can run that ladder without opening the container.
-        It uses the ladder's own definition of "worth having",
-        recommended_bytes, which is the number waste_plan_memory exists to
-        give. The CLI never relies on this: --models requires an explicit
-        --budget, so every figure on that path is exact.
+        A prediction, and named one. With 0 the engine does not insist on
+        its ideal cache size: waste_open sizes itself to whatever fits under
+        ~3/4 of waste_usable_ram, taking a smaller cache on a tighter
+        machine rather than refusing to open. So the figure this check
+        needs is not "what it would ideally take" — recommended_bytes — but
+        "the least it can run with": floor_bytes, the resident trunk and
+        state before a single expert is cached. Pricing at the recommended
+        figure would refuse a load the engine, sizing itself down, would
+        have opened fine.
+
+        A prediction, and named one: nothing here can run the ladder without
+        opening the container, so this reads only the manifest through
+        waste_plan_memory. The CLI never relies on this: --models requires
+        an explicit --budget, so every figure on that path is exact; this is
+        what a load with no budget is priced by instead, including one
+        registered on the fly by --auto-register.
         """
         try:
             ctx = int(self.engine_kwargs.get("ctx_tokens") or 0)
             plan = self.memory_plan(path, ctx)
         except (EngineError, OSError):
             return 0
-        return int(getattr(plan, "recommended_bytes", 0))
+        return int(getattr(plan, "floor_bytes", 0))
 
     def check_room(self, model_id: str, path: str) -> None:
         """Refuse a load that would not fit next to what stays resident.

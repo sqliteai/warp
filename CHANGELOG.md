@@ -97,6 +97,17 @@ No ABI move: `src/waste.h` changes only its version macros.
 
 ### Fixed
 
+- **A no-`--budget` swap is now priced by the container's floor, not its
+  recommended figure.** The resident-set check prices a load that arrives
+  with no `--budget` — the single-container default, and the path an
+  `--auto-register`ed container takes — from the container's own plan, at
+  the floor: the least it can run with, which is the figure the engine
+  actually holds while it sizes its expert cache down. Pricing at the
+  recommended figure refused a load the engine would have opened fine;
+  `serve/server.py`'s `planned_budget` now returns the floor, and the
+  no-budget arithmetic in `tests/serve/test_server.py` pins it. A load
+  that fits the floor next to what is resident is served, not refused.
+
 - **`"loaded"` on `GET /v1/models` now means residency, as
   `POST /v1/models/load` already said it did.** The registry listing set
   `loaded: true` only for the model being served, so under

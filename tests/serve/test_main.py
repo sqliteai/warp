@@ -48,6 +48,18 @@ class TestUsageWithModels(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("--usage cannot be used with --models", stderr.getvalue())
 
+    def test_usage_with_auto_register_is_refused(self):
+        """--auto-register also opts into switching, so the same refusal
+        applies: a learned hotlist is specific to one container, and a
+        caller that did not name one is not allowed to teach the server a
+        hotlist for a container it has not opened."""
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            rc = main(["dummy.waste", "--auto-register", "--usage", "hotlist.waste"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--usage cannot be used with --models or --auto-register",
+                      stderr.getvalue())
+
 class TestRegistryBudget(unittest.TestCase):
     """--models is refused unless --budget shows that 2 x budget fits."""
 

@@ -341,6 +341,18 @@ string before the registry existed.
     curl localhost:8000/v1/models/load \
         -d '{"model":"glm53"}'                    # swap, then answer
 
+`--auto-register` opts into the same switching without naming the set:
+`POST /v1/models/load` may register a container by pathname it has not
+seen before, instead of refusing any id outside `--models`. Off by
+default — the same reason `--allow-local-images` is — because a client
+that can reach the port could otherwise make the server open an
+arbitrary file on it. Because it is a switch, it is budgeted the same
+way: the load is priced against `--budget`, or against the container's
+own plan when none is set, and refused with 507 if it would not fit.
+`--usage` cannot be combined with either: a learned hotlist is specific
+to one container, and a caller that did not name one is not allowed to
+teach the server a hotlist for a container it has not opened.
+
 What a swap does:
 
 - It waits for the engine lock, so a generation in flight finishes before
@@ -355,11 +367,14 @@ What a swap does:
   leaves the server serving what it was serving and answers 500 with the
   engine's own reason. The cost of that guarantee is a moment where both
   containers are resident, and that moment is checked rather than
-  assumed: `--models` **requires `--budget`**, and `2 x budget` has to
-  fit in `waste_usable_ram()` or the server refuses to start. The reason
-  is the default. With `--budget 0` each context sizes itself to as much
-  as 3/4 of usable RAM, so two of them at once is ~1.5x what the process
-  may use — paging, not slowness. At startup the numbers are printed:
+  assumed: a set that can swap **requires `--budget`**, and `2 x budget`
+  has to fit in `waste_usable_ram()` or the server refuses to start —
+  `--models` and `--auto-register` alike, since both are switches. The
+  reason is the default. With `--budget 0` each context sizes itself to
+  as much as 3/4 of usable RAM, so two of them at once is ~1.5x what the
+  process may use — paging, not slowness; and when no budget is set the
+  check prices a load from the container's own plan, at its floor. At
+  startup the numbers are printed:
 
       registry  glm53, ds41
                 glm53  floor 12.3 GB, recommended 30.1 GB
@@ -531,7 +546,7 @@ python3 -m serve MODEL [options]
   --host, --port, --model-id, --api-key
   --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses,
                      which is up to 3/4 of usable RAM per context — so
-                     --models needs this set explicitly)
+                     a set that can swap needs this set explicitly)
   --ctx N            context tokens
   --threads N        compute threads (0 = one per core)
   --cpus LIST        restrict them to a cpu list, e.g. 0-5 or 0-2,6-8;
@@ -551,6 +566,10 @@ python3 -m serve MODEL [options]
                      the model it replaces). Requires --budget, because a
                      swap holds two contexts at once: 2 x budget has to
                      fit in RAM or the server refuses to start
+  --auto-register    let /v1/models/load register a container by pathname
+                     it has not seen before, instead of refusing any id
+                     outside --models; off by default, and --usage cannot
+                     be combined with it
   --keep-previous    keep the replaced model resident instead of unloading
                      it; every model switched to stays resident, so the
                      load that would put the set over the machine's RAM is

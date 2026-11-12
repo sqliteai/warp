@@ -1359,21 +1359,22 @@ class TestSwapMemoryBudgetKeepPrevious(TestSwapMemoryBudget):
 class TestSwapMemoryBudgetWithoutABudget(ServerTestCase):
     """No --budget: the engine sizes each context itself, so there is no
     ceiling to count with and the check prices the container with
-    waste_plan_memory instead — recommended_bytes, the ladder's own
-    definition of "worth having". The CLI does not rely on this, because
-    --models requires an explicit --budget; a host that calls serve()
-    directly is the case it covers."""
+    waste_plan_memory instead — at its floor, the least it can run with,
+    which is the figure that has to fit while the engine is left to size
+    its own expert cache. The CLI does not rely on this, because --models
+    requires an explicit --budget; a host that calls serve() directly is
+    the case it covers."""
 
     usable = 12
-    recommended = 8
+    floor_bytes = 4
 
     class Plan:
-        def __init__(self, recommended: int):
-            self.floor_bytes = 4
-            self.recommended_bytes = recommended
+        def __init__(self, floor: int):
+            self.floor_bytes = floor
+            self.recommended_bytes = 8
 
     def plan(self, path: str, ctx: int):
-        return self.Plan(self.recommended)
+        return self.Plan(self.floor_bytes)
 
     def make_engine(self, path: str) -> FakeEngine:
         engine = FakeEngine(model_path=path, markers=dict(MARKERS))
@@ -1388,6 +1389,9 @@ class TestSwapMemoryBudgetWithoutABudget(ServerTestCase):
             "memory_plan": self.plan,
         }
 
+    def load(self, model):
+        return self.post("/v1/models/load", {"model": model})
+
     def setUp(self):
         self.made: list[FakeEngine] = []
         self.engine_kwargs = {"model_path": "/fake/start.waste"}
@@ -1400,17 +1404,24 @@ class TestSwapMemoryBudgetWithoutABudget(ServerTestCase):
         returns for a real one."""
         self.assertEqual(self.server.engine_budget(self.engine), 5)
 
-    def test_a_container_without_a_budget_is_priced_by_its_plan(self):
+    def test_a_container_without_a_budget_is_priced_by_its_floor(self):
+        """The engine sizes its own cache to whatever fits, so a load with
+        no budget is priced by the plan's floor — the least the container
+        can run with — and not by the recommended figure, which is the one
+        the engine would only reach for when the machine could spare it.
+        A load the engine could have opened must not be refused for asking
+        for more than it asked for."""
         from serve import api as api_mod
-        with self.assertRaises(api_mod.APIError) as cm:
-            self.server.load_model("swap-a")
-        self.assertEqual(cm.exception.status, 507)
-        self.assertEqual(cm.exception.type, "insufficient_memory")
-        message = str(cm.exception)
-        self.assertIn("8 B", message)           # recommended, from the plan
-        self.assertIn("5 B", message)           # the resident, measured
-        self.assertIn("13 B", message)          # against 12 B usable
-        self.assertEqual(self.made, [])
+        self.assertEqual(self.server.planned_budget("/fake/a.waste"),
+                         self.floor_bytes)
+
+    def test_a_load_fitting_the_no_budget_window_is_not_refused(self):
+        """held 5 + floor 4 = 9 against usable 12: the no-budget swap
+        fits, and is not refused before the container is opened."""
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "swap-a")
+        self.assertEqual(self.made[0].model_path, "/fake/a.waste")
 
     def test_the_same_load_fits_a_slightly_larger_machine(self):
         srv = serve(self.engine, host="127.0.0.1", port=0,
@@ -1419,6 +1430,43 @@ class TestSwapMemoryBudgetWithoutABudget(ServerTestCase):
         self.addCleanup(srv.server_close)
         self.assertEqual(srv.load_model("swap-a"), "test-model")
         self.assertEqual(len(self.made), 1)
+
+
+class TestSwapMemoryBudgetWithoutABudgetRefused(TestSwapMemoryBudgetWithoutABudget):
+    """No --budget and a floor that does not fit next to the resident: the
+    swap is refused with 507, at the figure the plan named — the same
+    refusal an explicit budget would have produced, at the number the
+    engine would have picked for itself."""
+
+    usable = 6        # held 5 + floor 4 = 9 > 6
+
+    def test_the_same_load_fits_a_slightly_larger_machine(self):
+        """The inherited version builds a server a byte bigger than this
+        one and expects the load to fit; here the machine got smaller, so
+        the load that fit the parent does not fit here."""
+        srv = serve(self.engine, host="127.0.0.1", port=0,
+                    model_id="test-model", log_requests=False,
+                    **self.server_kwargs_for(self.usable + 1))
+        self.addCleanup(srv.server_close)
+        from serve import api as api_mod
+        with self.assertRaises(api_mod.APIError) as cm:
+            srv.load_model("swap-a")
+        self.assertEqual(cm.exception.status, 507)
+        self.assertEqual(cm.exception.type, "insufficient_memory")
+
+    def test_a_load_fitting_the_no_budget_window_is_not_refused(self):
+        """The inherited version assumed the parent's machine (12 B); this
+        subclass is smaller, so the load that fit there does not fit here."""
+        from serve import api as api_mod
+        with self.assertRaises(api_mod.APIError) as cm:
+            self.server.load_model("swap-a")
+        self.assertEqual(cm.exception.status, 507)
+        self.assertEqual(cm.exception.type, "insufficient_memory")
+        message = str(cm.exception)
+        self.assertIn("4 B", message)           # the floor, from the plan
+        self.assertIn("5 B", message)           # the resident, measured
+        self.assertIn("9 B", message)           # against what the machine has
+        self.assertEqual(self.made, [])
 
 
 class TestAutoRegister(ServerTestCase):
