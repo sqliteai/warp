@@ -25,18 +25,137 @@ from . import api, dsml, xtml                                      # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      WASTE_E_ARG, WASTE_E_BUSY, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
-                     plan_memory)
-from .server import serve                                    # noqa: E402
+                     plan_memory, usable_ram)
+from .server import ModelLoadError, serve                       # noqa: E402
 
 POLICIES = {"lfru": CACHE_LFRU, "lru": CACHE_LRU}
 
 
-def human(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
+def parse_registry(specs: list[str]) -> dict[str, str]:
+    """--models entries as {id: path}.
+
+    `PATH[=ID]`, ID defaulting to the file name without .waste — the
+    same default --model-id uses. Duplicate ids are an error rather than
+    a quiet overwrite: two containers behind one name means a client's
+    "load this model" sometimes loads a different one than it just
+    listed, and that failure announces itself only under load.
+    """
+    registry: dict[str, str] = {}
+    for spec in specs:
+        path, _, custom = spec.partition("=")
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise SystemExit(f"--models: no such container: {p}")
+        mid = custom or p.name.removesuffix(".waste")
+        if mid in registry:
+            raise SystemExit(
+                f"--models: duplicate model id: {mid} (both "
+                f"{registry[mid]} and {p})")
+        registry[mid] = str(p)
+    return registry
+
+
+class RegistryBudgetError(Exception):
+    """--models and --budget are not a pair that fits in this machine."""
+
+
+def check_registry_budget(models: dict[str, str], *, budget: int,
+                          usable: int) -> None:
+    """Refuse a registry whose swap window does not fit.
+
+    A swap holds two contexts at once: the new container is opened before
+    the old one is closed, deliberately, so that a failed open leaves the
+    server serving what it was serving. docs/SERVE.md asked the operator to
+    size --budget so that moment fits and nothing checked it — and with the
+    default budget of 0 the moment is far worse than "the sum of the two":
+    0 means the engine sizes each context itself, up to 3/4 of
+    waste_usable_ram (waste.h, waste_cfg.ram_budget_bytes), so two of them
+    is ~1.5x what the process may use. That is a paging run, not a slow one.
+
+    So, two failures, and they are different things to say:
+
+    - No budget at all: the pair cannot be computed, and the number the
+      engine would pick is not a number this process should be allowed to
+      pick twice. Refused rather than guessed at.
+    - An explicit budget with no room for its pair: 2 x budget over usable.
+      The largest budget that fits is usable // 2, and naming that figure
+      is the difference between an error and a puzzle.
+
+    `usable` is passed in rather than measured here: the caller prints it,
+    and a test needs no machine of its own. 0 means the platform would not
+    say (see main) and is neither a pass nor a failure — refusing to start
+    because a machine will not report its RAM is worse than the thing this
+    exists to prevent. The runtime check in serve/server.py (check_room)
+    still refuses a load that would exceed what is left.
+    """
+    if not models or not usable:
+        return
+    machine = api.human_bytes(usable)
+    half = api.human_bytes(usable // 2)
+    if not budget:
+        per_ctx = api.human_bytes(usable - usable // 4)
+        raise RegistryBudgetError(
+            f"--models needs an explicit --budget: with 0 the engine sizes "
+            f"each context itself, up to {per_ctx} of the {machine} this "
+            f"process may use, and a swap holds two of them at once — the "
+            f"new container is opened before the old one is closed, so that "
+            f"a failed open leaves the server serving what it was serving. "
+            f"Give --budget {half} or less, or drop --models and serve one "
+            f"container.")
+    if 2 * budget > usable:
+        raise RegistryBudgetError(
+            f"--budget {api.human_bytes(budget)} does not fit twice: a swap "
+            f"holds the container being loaded and the one it replaces at "
+            f"the same time, which is {api.human_bytes(2 * budget)} against "
+            f"the {machine} this process may use. Use {half} or less, or "
+            f"drop --models.")
+
+
+def describe_registry(models: dict[str, str], *, budget: int, usable: int,
+                      ctx: int = 0, plan=plan_memory) -> list[str]:
+    """What --models will cost, as lines: one per container, then the
+    arithmetic a swap performs.
+
+    Returned rather than printed so the same lines can stand under the
+    startup banner, under --plan, and under a refusal — the last being
+    where they are worth most, because that is when the operator is
+    choosing a --budget.
+    """
+    lines = []
+    widest = max((len(mid) for mid in models), default=0)
+    for mid, path in models.items():
+        try:
+            p = plan(path, ctx)
+        except EngineError as e:
+            lines.append(f"{mid:<{widest}}  unreadable: {e}")
+            continue
+        lines.append(f"{mid:<{widest}}  floor {api.human_bytes(p.floor_bytes)}"
+                     f", recommended {api.human_bytes(p.recommended_bytes)}")
+    if not usable:
+        lines.append("this platform reports no usable-RAM figure; the pair "
+                     "is not checked")
+    elif not budget:
+        lines.append(f"no --budget: each context sizes itself to up to "
+                     f"{api.human_bytes(usable - usable // 4)} of the "
+                     f"{api.human_bytes(usable)} this process may use")
+    else:
+        pair = 2 * budget
+        if pair <= usable:
+            lines.append(f"two at once: {api.human_bytes(pair)} against "
+                         f"{api.human_bytes(usable)} usable — fits")
+        else:
+            lines.append(f"two at once: {api.human_bytes(pair)} against "
+                         f"{api.human_bytes(usable)} usable — does not fit; "
+                         f"the largest --budget is "
+                         f"{api.human_bytes(usable // 2)}")
+    return lines
+
+
+# api.human_bytes, under the name the banner lines below were written
+# with. One formatter for the plans, the registry lines and the 507
+# refusal a swap can answer with: an operator comparing them should not be
+# doing two conversions.
+human = api.human_bytes
 
 
 def parse_size(text: str) -> int:
@@ -82,6 +201,16 @@ examples:
 
   curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \\
     -d '{"model":"waste","messages":[{"role":"user","content":"hi"}]}'
+
+  python3 -m serve ~/models/k3.waste --models ~/models/glm53.waste \\
+        --models ~/models/deepseek41.waste=ds41 --budget 24G
+        # --budget is required with --models: a swap opens the new
+        # container before closing the old one, so 2 x budget has to fit
+        # in RAM or the server refuses to start;
+        # POST /v1/models/load {"model":"glm53"} swaps to it, unloading k3;
+        # add --keep-previous to hold both resident instead — every model
+        # switched to stays resident, and a load that would put the set
+        # over this machine's RAM answers 507
 """)
     ap.add_argument("model", help="path to the .waste container")
     ap.add_argument("--host", default="127.0.0.1",
@@ -95,7 +224,9 @@ examples:
 
     g = ap.add_argument_group("engine")
     g.add_argument("--budget", type=parse_size, default=0, metavar="SIZE",
-                   help="hard RAM ceiling, e.g. 48G. 0 lets the engine choose")
+                   help="hard RAM ceiling, e.g. 48G. 0 lets the engine choose "
+                        "— up to 3/4 of the RAM this process may use, so a "
+                        "swap (below) needs it set explicitly")
     g.add_argument("--ctx", type=bounded_int(0, (1 << 32) - 1),
                    default=0, metavar="N",
                    help="context tokens (0 = container default)")
@@ -140,16 +271,94 @@ examples:
                    help="let requests name images by filesystem path. Off by "
                         "default: it lets any client read files the server "
                         "can reach")
+    s.add_argument("--models", action="append", default=[], metavar="PATH[=ID]",
+                   help="an additional container a client may switch to "
+                        "with POST /v1/models/load (repeatable; id defaults "
+                        "to the file name without .waste). Switching "
+                        "unloads the model it replaces unless "
+                        "--keep-previous. Requires --budget: a swap holds "
+                        "the new container and the old one at once, so "
+                        "2 x budget must fit in RAM, and refusing to start "
+                        "otherwise is the point — see docs/SERVE.md")
+    s.add_argument("--keep-previous", action="store_true",
+                   help="keep a model resident when another is loaded. "
+                        "Off by default, and deliberately: the RAM two "
+                        "contexts need together is the sum of their "
+                        "budgets, and on the machines this engine targets "
+                        "that is the difference between working and "
+                        "paging. Generation still serves only the current "
+                        "model — each waste_ctx takes one caller — but "
+                        "switching back to a resident one is a slot move "
+                        "instead of a reopen of a multi-gigabyte "
+                        "container. Every model switched to stays "
+                        "resident, so the load that would put the set "
+                        "over the machine's RAM is refused with 507")
+    s.add_argument("--auto-register", action="store_true",
+                   help="let POST /v1/models/load register a container "
+                        "by pathname it has not seen before, instead of "
+                        "refusing any id outside --models. Off by default: "
+                        "any client that can reach this port could otherwise "
+                        "make it open an arbitrary file on this machine — "
+                        "the same reason --allow-local-images is off by "
+                        "default. The id defaults to the file name without "
+                        ".waste, or the caller's own 'model' if it gives "
+                        "one; the load is still priced against --budget (or, "
+                        "with none, the container's plan) and refused with "
+                        "507 if it would not fit. With the flag on, a load "
+                        "naming an id the server has not seen is refused, and "
+                        "a load carrying a path it has not seen is the way in; "
+                        "the two are distinguishable, so the endpoint can say "
+                        "whether a path exists on this host. Being an opt-in to "
+                        "switching, it is also an opt-in to the strict "
+                        "validation --models turns on: a generation naming a "
+                        "model this server does not know answers 404 rather "
+                        "than being served by whatever is loaded. --usage "
+                        "cannot be combined with it: a learned hotlist is "
+                        "specific to one container")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
+    s.add_argument("--no-log-requests", action="store_true",
+                   help="silence the per-request log lines. On by default: "
+                        "each line names the model that served or was "
+                        "refused — on a server that swaps models, the log "
+                        "is how you find out which one answered")
 
     args = ap.parse_args(argv)
+
+    if args.usage and (args.models or args.auto_register):
+        print("--usage cannot be used with --models or --auto-register: a "
+              "learned hotlist is specific to one container", file=sys.stderr)
+        return 2
 
     model = Path(args.model).expanduser()
     if not model.exists():
         print(f"no such container: {model}", file=sys.stderr)
         return 2
     model_id = args.model_id or model.name.removesuffix(".waste")
+
+    registry = parse_registry(args.models)
+    # What this process may use, measured once: the startup check below,
+    # the banner, and every swap this server will perform all count
+    # against one number rather than three readings that can disagree.
+    # 0 means the platform would not say — see check_registry_budget.
+    try:
+        usable = usable_ram()
+    except EngineError:
+        usable = 0
+
+    # Priced before anything is opened, and skipped under --plan, which is
+    # the command that exists to tell an operator the numbers *before*
+    # they pick a --budget.
+    registry_lines = describe_registry(registry, budget=args.budget,
+                                       usable=usable, ctx=args.ctx)
+    if registry and not args.plan:
+        try:
+            check_registry_budget(registry, budget=args.budget, usable=usable)
+        except RegistryBudgetError as e:
+            print(f"{e}\n", file=sys.stderr)
+            for line in registry_lines:
+                print(f"  {line}", file=sys.stderr)
+            return 2
 
     try:
         if args.plan:
@@ -167,6 +376,10 @@ examples:
                       f"(only with --vision)")
             if ram:
                 print(f"\n  this machine has {human(ram)}")
+            if registry:
+                print("\n  registry")
+                for line in registry_lines:
+                    print(f"    {line}")
             return 0
 
         engine = Engine(
@@ -217,7 +430,24 @@ examples:
                     api_key=args.api_key,
                     default_max_tokens=args.max_tokens,
                     default_thinking=not args.no_thinking,
-                    allow_local_images=args.allow_local_images)
+                    allow_local_images=args.allow_local_images,
+                    log_requests=not args.no_log_requests,
+                    models=registry,
+                    keep_previous=args.keep_previous,
+                    auto_register=args.auto_register,
+                    usable_ram=usable,
+                    engine_kwargs={
+                        "ram_budget_bytes": args.budget,
+                        "ctx_tokens": args.ctx,
+                        "n_threads": args.threads,
+                        "cpu_list": args.cpus,
+                        "cache_policy": POLICIES[args.cache],
+                        "direct_io": not args.no_direct_io,
+                        "vision": args.vision,
+                        "verify_records": args.verify,
+                        "usage_path": args.usage,
+                        "exclusive_open": args.exclusive_open,
+                    })
     except (EngineError, OSError) as e:
         engine.close()
         print(f"{e}", file=sys.stderr)
@@ -257,6 +487,20 @@ examples:
         print(f"chat     from {model}/chat.json — plain conversation, "
               f"{think},\n         {images}, {tools}")
 
+    # What a client may switch to, and what that costs — on the same
+    # lines as the banner rather than in a manual, because the swap
+    # window is the one number here an operator can still get wrong.
+    if registry:
+        print(f"{'registry':<9} {', '.join(sorted(registry))}")
+        for line in registry_lines:
+            print(f"{'':<9} {line}")
+    if registry and args.keep_previous:
+        over = (f"a load that would put them over {human(usable)} answers 507"
+                if usable else "the resident set is not checked on this "
+                               "platform")
+        print(f"{'':<9} keep-previous: every model switched to stays "
+              f"resident;\n{'':<9} {over}")
+
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "
           f"(POST {'/v1/completions' if srv.chat_error else '/v1/chat/completions'})")
@@ -272,7 +516,7 @@ examples:
     finally:
         srv.shutdown()
         srv.server_close()
-        engine.close()
+        srv.close_engines()
         shutil.rmtree(srv.tmpdir, ignore_errors=True)
     return 0
 

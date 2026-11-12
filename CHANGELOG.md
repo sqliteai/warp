@@ -97,6 +97,49 @@ No ABI move: `src/waste.h` changes only its version macros.
 
 ### Fixed
 
+- **A no-`--budget` swap is now priced by the container's floor, not its
+  recommended figure.** The resident-set check prices a load that arrives
+  with no `--budget` — the single-container default, and the path an
+  `--auto-register`ed container takes — from the container's own plan, at
+  the floor: the least it can run with, which is the figure the engine
+  actually holds while it sizes its expert cache down. Pricing at the
+  recommended figure refused a load the engine would have opened fine;
+  `serve/server.py`'s `planned_budget` now returns the floor, and the
+  no-budget arithmetic in `tests/serve/test_server.py` pins it. A load
+  that fits the floor next to what is resident is served, not refused.
+
+- **`"loaded"` on `GET /v1/models` now means residency, as
+  `POST /v1/models/load` already said it did.** The registry listing set
+  `loaded: true` only for the model being served, so under
+  `--keep-previous` a model the server still holds an open `waste_ctx`
+  for was listed `loaded: false` — indistinguishable from a container
+  that was never opened — while the load response's `models` field
+  counted it as resident, and a generation naming it was refused as "not
+  loaded". The two endpoints now agree: `loaded` is `mid in engines`,
+  the same set the load response reports, and `GET /v1/models/{id}` says
+  the same for one entry. The 409 for a model that is resident but not
+  current says "resident but not the model being served" rather than
+  "registered but not loaded"; the `model_not_loaded` type and status
+  are unchanged. The `waste` shape still travels only on the current
+  entry — the per-model facts move with the current slot and are
+  re-derived when a swap makes a resident model current again. Tests in
+  `tests/serve/test_server.py`.
+
+- **A single-container server serves any model name again.** The model
+  registry made `check_model_request` strict for every deployment: with
+  no `--models`, the registry holds only the loaded model, so a request
+  naming anything else was a 404 — including the fixed name most OpenAI
+  clients are configured with and the `"model": "waste"` example in
+  `serve --help` itself, neither of which a client can easily change.
+  The server's own id defaults to the container's file name
+  (`k3.waste` → `k3`), so even the "correct" name was one most clients
+  did not know. What an existing deployment guaranteed was "any name is
+  answered by the one container"; that is restored: absent, the loaded
+  id, or any other string all serve. Strict validation — a 404 for a
+  name the registry does not know, a 409 for one it knows but has not
+  loaded — is what `--models` opts into, and is unchanged there. Tests
+  for both behaviours in `tests/serve/test_server.py`.
+
 - **DeepSeek-V4.1 without `--reclaim`: the Engram index was never
   written** (#71, #72 — found and fixed by @helenkwok converting the
   release on an EPYC 7713). Only the `--reclaim` path called
@@ -125,6 +168,48 @@ No ABI move: `src/waste.h` changes only its version macros.
 
 ### Measured and not adopted
 
+- **`--models` now has to prove its swap fits, and a load that would not
+  is a 507.** A swap opens the new container before closing the old one —
+  the order that makes a failed open leave the server serving what it was
+  serving — so two contexts are resident at once, and `docs/SERVE.md`
+  asked the operator to size `--budget` so that moment fits while nothing
+  checked. The default made it worse than "the sum of the two": with
+  `--budget 0` each context sizes itself to as much as 3/4 of
+  `waste_usable_ram()`, so a swap ran at ~1.5x what the process may use —
+  a paging run, not a slow one.
+
+  `--models` now requires an explicit `--budget`, and the server refuses
+  to start unless `2 x budget` fits, naming the largest budget that does;
+  the same lines are printed under the startup banner and by `--plan`,
+  which is where a budget gets chosen. At runtime the resident set is
+  counted at every load — each engine's budget, or the floor and expert
+  cache `waste_memory_used` reports for one that chose its own — and a
+  load that would not fit is refused with **507**
+  (`insufficient_memory`) *before* the container is opened: nothing is
+  closed, nothing is half-loaded, the previous model keeps serving, and
+  the message says what it needed next to what was already held. 507
+  rather than 503 because asking again cannot help.
+
+  That is also what bounds `--keep-previous`, whose resident set grows
+  with every model ever switched to and which no startup check can price
+  in advance: the cap is derived from the budgets rather than from a
+  separate `--max-resident` count that could disagree with them, and a
+  slot move to a model that is already resident is never refused because
+  it allocates nothing. Evicting a resident model to make room was the
+  alternative and is not done — changing what is resident behind a
+  client's back is the failure `--keep-previous` exists to prevent.
+
+  `serve/` goes to 144 server tests (from 135) plus a new
+  `tests/serve/test_main.py` of 12, for the arithmetic on its own.
+
+- **A strict CI job for the K2 tool protocol**, the one GLM has had and
+  which `ci.yml` used to have to exempt K2 from in so many words: "the same
+  ground-truth rule the K2 template check in tests/run.sh applies, except
+  this one may not skip". Now neither may. `CI_K2_ORACLE_STRICT=1` turns
+  every skip path — missing template, missing jinja2, unresolved markers —
+  into a failure, and the job asserts all **seven** checks ran, so it
+  cannot be green by having done nothing. Vendoring the template is what
+  made it possible: no download, no weights, no machine-local `~/models`.
 - **The i8mm trunk kernel as DeepSeek-V4.1's default.** 3.87–3.97 tok/s
   becomes 4.52–4.56. Of 2,080 routing decisions it flips one, a tie the
   reference itself cannot resolve, and the 201 others that differ all
