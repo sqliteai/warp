@@ -1102,6 +1102,8 @@ class Handler(BaseHTTPRequestHandler):
             hit = stop_at(parser.content)
             if hit is not None:
                 parser.content = parser.content[:hit]
+                # Text a parser still holds back follows the cut (DSML).
+                getattr(parser, "drop_held", lambda: None)()
             end = len(parser.content) if final or hit is not None else safe_content_end(
                 parser.content)
             sent = state["content_sent"]

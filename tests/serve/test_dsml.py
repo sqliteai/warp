@@ -287,5 +287,69 @@ class TestReplyReader(unittest.TestCase):
         self.assertEqual(msg["reasoning_content"], "why")
 
 
+def stream(text, thinking=False):
+    """drive(), keeping the content deltas a streaming client would receive."""
+    p = dsml.DSMLParser(thinking=thinking, markers=ID_MARKER)
+    streamed = []
+    i = 0
+    while i < len(text):
+        hit, at = None, len(text)
+        for m in dsml.MARKERS:
+            q = text.find(m, i)
+            if q != -1 and q < at:
+                at, hit = q, m
+        for ch in text[i:at]:
+            streamed.append(p.feed_token(-1, ch).content)
+        if hit is None:
+            break
+        streamed.append(p.feed_token(MARKER_ID[hit], hit).content)
+        i = at + len(hit)
+    streamed.append(p.finish().content)
+    return p, "".join(streamed)
+
+
+class TestStreamedContent(unittest.TestCase):
+    """The content a client streams is the content of the final message."""
+
+    def test_the_lead_in_to_a_tool_call_block_is_not_streamed(self):
+        d = dsml.DSML
+        call = (f"<{d} calls>\n<{d} invoke name=\"get\">\n"
+                f"<{d} parameter name=\"city\" string=\"true\">Rome</{d} parameter>\n"
+                f"</{d} invoke>\n</{d} calls>")
+        for lead in ("Let me check.\n\n", "Let me check.", ""):
+            with self.subTest(lead=lead):
+                p, streamed = stream(lead + call + dsml.EOS)
+                self.assertEqual(p.content, lead.rstrip("\n") if lead.endswith("\n\n") else lead)
+                self.assertEqual(streamed, p.content)
+                self.assertEqual(len(p.tool_calls), 1)
+
+    def test_text_that_only_looks_like_a_lead_in_is_streamed(self):
+        for text in ("a\n\nb", "x < y", "x <\n\ny", "ends with a newline\n",
+                     "ends with two\n\n", "ends with <"):
+            for end in (dsml.EOS, ""):
+                with self.subTest(text=text, eos=bool(end)):
+                    p, streamed = stream(text + end)
+                    self.assertEqual(p.content, text)
+                    self.assertEqual(streamed, text)
+
+    def test_a_cut_content_does_not_get_held_text_back(self):
+        """server.py cuts the content at a stop string. A token that ends
+        the stop and starts a lead-in ("P\\n") leaves "\\n" held, after the
+        cut; finish() must not put it back."""
+        p = dsml.DSMLParser(markers=ID_MARKER)
+        for piece in ("abc STO", "P\n"):
+            p.feed_token(-1, piece)
+        self.assertEqual(p.content, "abc STOP")
+        p.content = p.content[:p.content.find("STOP")]
+        p.drop_held()
+        p.finish()
+        self.assertEqual(p.content, "abc ")
+
+    def test_reasoning_is_streamed_as_it_arrives(self):
+        p, _ = stream("why\n\n</think>because" + dsml.EOS, thinking=True)
+        self.assertEqual(p.reasoning, "why\n\n")
+        self.assertEqual(p.content, "because")
+
+
 if __name__ == "__main__":
     unittest.main()
