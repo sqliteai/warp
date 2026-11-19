@@ -53,6 +53,28 @@ class TestDSMLStreaming(ServerTestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "abc ")
         self.assertEqual(self.streamed_content(stop="STOP"), "abc ")
 
+    def test_a_stop_string_does_not_match_the_lead_in_to_a_tool_call(self):
+        # The "\n\n<" before a block is formatting, not content, so a stop
+        # string cannot end the reply there and lose the call. A stop inside
+        # the content still cuts it.
+        self.engine.reply = "</think>Let me check.\n\n" + CALL + dsml.EOS
+        for stop in ("\n", "<"):
+            with self.subTest(stop=stop):
+                _, body = self.chat(tools=TOOLS, stop=stop)
+                choice = body["choices"][0]
+                self.assertEqual(choice["finish_reason"], "tool_calls")
+                self.assertEqual(choice["message"]["content"], "Let me check.")
+                self.assertEqual(
+                    choice["message"]["tool_calls"][0]["function"]["name"], "get")
+                self.assertEqual(
+                    self.streamed_content(tools=TOOLS, stop=stop), "Let me check.")
+
+        self.engine.reply = "</think>one\ntwo\n\n" + CALL + dsml.EOS
+        _, body = self.chat(tools=TOOLS, stop="\n")
+        self.assertEqual(body["choices"][0]["message"]["content"], "one")
+        self.assertNotIn("tool_calls", body["choices"][0]["message"])
+        self.assertEqual(self.streamed_content(tools=TOOLS, stop="\n"), "one")
+
 
 if __name__ == "__main__":
     unittest.main()
