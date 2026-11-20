@@ -345,6 +345,19 @@ class TestStreamedContent(unittest.TestCase):
         p.finish()
         self.assertEqual(p.content, "abc ")
 
+    def test_the_stop_floor_moves_past_each_tool_call_block(self):
+        """server.py matches a stop string only from stop_floor, so text
+        before a block is final once the block opens."""
+        d = dsml.DSML
+        call = (f"<{d} calls>\n<{d} invoke name=\"get\">\n</{d} invoke>\n"
+                f"</{d} calls>")
+        p, _ = stream("Let me check.\n\n" + dsml.EOS)
+        self.assertEqual(p.stop_floor, 0)
+        p, _ = stream("Let me check.\n\n" + call + "\nmore\n\n" + call + dsml.EOS)
+        self.assertEqual(p.content, "Let me check.\nmore")
+        self.assertEqual(p.stop_floor, len(p.content))
+        self.assertEqual(len(p.tool_calls), 2)
+
     def test_reasoning_is_streamed_as_it_arrives(self):
         p, _ = stream("why\n\n</think>because" + dsml.EOS, thinking=True)
         self.assertEqual(p.reasoning, "why\n\n")

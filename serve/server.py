@@ -1083,15 +1083,15 @@ class Handler(BaseHTTPRequestHandler):
         stops = [s for s in stops if s]
         state = {"n": 0, "stopped": False, "content_sent": 0}
 
-        def stop_at(text):
-            hits = [p for s in stops if (p := text.find(s)) >= 0]
+        def stop_at(text, floor):
+            hits = [p for s in stops if (p := text.find(s, floor)) >= 0]
             return min(hits) if hits else None
 
-        def safe_content_end(text):
+        def safe_content_end(text, floor):
             """Exclude a suffix that may become a stop on the next token."""
             end = len(text)
             for s in stops:
-                limit = min(len(s) - 1, len(text))
+                limit = min(len(s) - 1, len(text) - floor)
                 for n in range(limit, 0, -1):
                     if text.endswith(s[:n]):
                         end = min(end, len(text) - n)
@@ -1099,13 +1099,16 @@ class Handler(BaseHTTPRequestHandler):
             return end
 
         def deliver(delta, *, final=False):
-            hit = stop_at(parser.content)
+            # A parser may mark where its content restarts after a tool-call
+            # block (DSML): a stop string is not matched across the block.
+            floor = getattr(parser, "stop_floor", 0)
+            hit = stop_at(parser.content, floor)
             if hit is not None:
                 parser.content = parser.content[:hit]
                 # Text a parser still holds back follows the cut (DSML).
                 getattr(parser, "drop_held", lambda: None)()
             end = len(parser.content) if final or hit is not None else safe_content_end(
-                parser.content)
+                parser.content, floor)
             sent = state["content_sent"]
             delta.content = parser.content[sent:end] if end >= sent else ""
             state["content_sent"] = end

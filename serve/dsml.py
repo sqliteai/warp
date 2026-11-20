@@ -707,6 +707,10 @@ class DSMLParser:
         # back until the next token says whether a block opens, so a client
         # never streams text the final message drops.
         self._held = ""
+        # Where the content after the last tool-call block begins. A stop
+        # string is matched only from here: text before a block is final
+        # once the block opens, and a match cannot span the block.
+        self.stop_floor = 0
 
     @property
     def finished(self) -> bool:
@@ -842,6 +846,7 @@ class DSMLParser:
                     self.content = self.content[:-3]
                 elif self.content.endswith("<"):
                     self.content = self.content[:-1]
+                self.stop_floor = len(self.content)
             else:
                 self._in_calls = False
                 self._flush_call()

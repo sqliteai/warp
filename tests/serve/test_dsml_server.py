@@ -75,6 +75,16 @@ class TestDSMLStreaming(ServerTestCase):
         self.assertNotIn("tool_calls", body["choices"][0]["message"])
         self.assertEqual(self.streamed_content(tools=TOOLS, stop="\n"), "one")
 
+    def test_a_stop_string_does_not_match_across_a_tool_call(self):
+        self.engine.reply = ("</think>Let me check." + CALL + "\nmore"
+                             + dsml.EOS)
+        _, body = self.chat(tools=TOOLS, stop="check.\n")
+        message = body["choices"][0]["message"]
+        self.assertEqual(message["content"], "Let me check.\nmore")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "get")
+        self.assertEqual(self.streamed_content(tools=TOOLS, stop="check.\n"),
+                         "Let me check.\nmore")
+
 
 if __name__ == "__main__":
     unittest.main()
