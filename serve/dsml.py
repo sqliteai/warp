@@ -703,6 +703,14 @@ class DSMLParser:
         self._arg_string = True
         self._arg_text = ""
         self._in_param = False
+        # Content that may be the "\n\n<" in front of a tool-call block: held
+        # back until the next token says whether a block opens, so a client
+        # never streams text the final message drops.
+        self._held = ""
+        # Where the content after the last tool-call block begins. A stop
+        # string is matched only from here: text before a block is final
+        # once the block opens, and a match cannot span the block.
+        self.stop_floor = 0
 
     @property
     def finished(self) -> bool:
@@ -738,8 +746,14 @@ class DSMLParser:
         delta = Delta()
         if self._buf:
             self._literal("", delta)
+        self._release(delta)
         self._flush_call()
         return delta
+
+    def drop_held(self) -> None:
+        """The caller cut the content (a stop string): what is held back
+        comes after the cut, so it must not be released by finish()."""
+        self._held = ""
 
     def openai_message(self) -> dict:
         msg: dict[str, Any] = {"role": "assistant"}
@@ -753,6 +767,8 @@ class DSMLParser:
     # ---- internals ------------------------------------------------------
 
     def _marker(self, marker: str, delta: Delta) -> None:
+        if marker != DSML:
+            self._release(delta)
         if marker == THINK_CLOSE:
             self._in_think = False
             return
@@ -792,8 +808,19 @@ class DSMLParser:
             self.reasoning += piece
             delta.reasoning += piece
         else:
-            self.content += piece
-            delta.content += piece
+            text = self._held + piece
+            keep = _lead_in_suffix(text)
+            self._held = text[len(text) - keep:]
+            out = text[:len(text) - keep]
+            self.content += out
+            delta.content += out
+
+    def _release(self, delta: Delta) -> None:
+        """Send held-back content: whatever followed it was not a block."""
+        if self._held:
+            self.content += self._held
+            delta.content += self._held
+            self._held = ""
 
     def _tag(self, delta: Delta) -> None:
         """A `｜DSML｜` was seen; decide what element this is once its name
@@ -808,15 +835,23 @@ class DSMLParser:
             if not self._in_calls:
                 self._in_calls = True
                 # The two newlines before the block are prompt formatting,
-                # not content.
+                # not content. They are still held back, so they were never
+                # streamed; drop them there, and send anything else held.
+                if self._held.endswith("\n\n<"):
+                    self._held = self._held[:-3]
+                elif self._held.endswith("<"):
+                    self._held = self._held[:-1]
+                self._release(delta)
                 if self.content.endswith("\n\n<"):
                     self.content = self.content[:-3]
                 elif self.content.endswith("<"):
                     self.content = self.content[:-1]
+                self.stop_floor = len(self.content)
             else:
                 self._in_calls = False
                 self._flush_call()
         elif name.startswith(INVOKE_TAG.strip()):
+            self._release(delta)
             if "name=" in head:
                 self._flush_call()
                 # `ns::name` is one namespaced tool. OpenAI has no field for
@@ -859,6 +894,15 @@ class DSMLParser:
         if self._call is not None:
             self.tool_calls.append(self._call)
             self._call = None
+
+
+def _lead_in_suffix(text: str) -> int:
+    """Length of the end of `text` that could still become the "\n\n<" (or
+    the bare "<") a tool-call block is written after."""
+    for lead in ("\n\n<", "\n\n", "<", "\n"):
+        if text.endswith(lead):
+            return len(lead)
+    return 0
 
 
 def _attr(head: str, key: str) -> str:
