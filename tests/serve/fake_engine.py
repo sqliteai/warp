@@ -199,7 +199,7 @@ class FakeEngine:
     def generate(self, prompt: list[int], on_token: Callable, *,
                  temperature: float = 0.0, top_p=None, top_k=None, seed=None,
                  max_tokens: int = 512, grammar=None,
-                 stop_tokens=None) -> bool:
+                 stop_tokens=None, prefill_cb=None) -> bool:
         import time
 
         with self._lock:

@@ -50,6 +50,43 @@ from .engine import (Cancelled, Engine, EngineError, plan_memory,
                      usable_ram)
 from .regions import RegionParser
 
+
+def _make_prefill_cb(prompt_len: int):
+    """Return a prefill callback that logs progress to stderr.
+
+    Skips the log for trivial prompts (< 2 tokens) so short requests
+    produce no extra noise.  Overwrites a single line using \\r so the
+    server log stays readable.  Shows speed and ETA.
+    """
+    if prompt_len < 2:
+        return None
+    last_pct = -1
+    start = [0.0]
+    def _cb(done, total, ms):
+        nonlocal last_pct
+        if start[0] == 0.0:
+            start[0] = time.monotonic()
+        pct = int(100.0 * done / total + 0.5)
+        if pct != last_pct:
+            last_pct = pct
+            elapsed = time.monotonic() - start[0]
+            speed = done / elapsed if elapsed > 0 else 0
+            remaining = (total - done) / speed if speed > 0 else 0
+            if remaining >= 3600:
+                eta_str = f"  ETA {remaining / 3600:.1f}h"
+            elif remaining >= 60:
+                eta_str = f"  ETA {remaining / 60:.1f}m"
+            elif remaining >= 1:
+                eta_str = f"  ETA {remaining:.0f}s"
+            else:
+                eta_str = ""
+            sys.stderr.write(
+                f"\rPrefilling {pct:3d}%  {done}/{total} tokens  "
+                f"{speed:.0f} t/s{eta_str}")
+            sys.stderr.flush()
+        return 0
+    return _cb
+
 SERVER_NAME = "waste"
 
 # A body larger than this is refused before it is read into memory. A chat
@@ -1122,12 +1159,17 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             return True
 
+        prefill = _make_prefill_cb(len(prompt.tokens))
         completed = engine.generate(
             prompt.tokens, on_token,
             temperature=opts["temperature"], top_p=opts["top_p"],
             top_k=opts["top_k"], seed=opts["seed"],
             max_tokens=opts["max_tokens"],
-            stop_tokens=slot.stop_tokens or None)
+            stop_tokens=slot.stop_tokens or None,
+            prefill_cb=prefill)
+        if prefill is not None:
+            sys.stderr.write("\r                            \n")
+            sys.stderr.flush()
         tail = parser.finish()
         if not state["stopped"]:
             if deliver(tail, final=True):
@@ -1301,11 +1343,16 @@ class Handler(BaseHTTPRequestHandler):
                         return False
                 return True
 
+            prefill = _make_prefill_cb(len(tokens))
             completed = engine.generate(
                 tokens, on_token, temperature=opts["temperature"],
                 top_p=opts["top_p"], top_k=opts["top_k"], seed=opts["seed"],
                 max_tokens=opts["max_tokens"],
-                stop_tokens=slot.stop_tokens or None)
+                stop_tokens=slot.stop_tokens or None,
+                prefill_cb=prefill)
+            if prefill is not None:
+                sys.stderr.write("\r                            \n")
+                sys.stderr.flush()
 
         text = "".join(pieces)
         for s in stops:

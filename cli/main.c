@@ -841,6 +841,11 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     waste_status st;
     if (build_prompt_segs(c, o, segs, ns, ids, MAXTOK, &n)) return 1;
 
+    sink s;
+    memset(&s, 0, sizeof s);
+    s.quiet = o->quiet;
+    s.stop = o->stop;
+
     waste_gen_params p;
     waste_gen_params_init(&p);
     p.max_tokens = o->max_tokens;
@@ -848,11 +853,6 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     p.top_p = o->top_p;
     p.top_k = o->top_k;
     p.seed = o->seed;
-
-    sink s;
-    memset(&s, 0, sizeof s);
-    s.quiet = o->quiet;
-    s.stop = o->stop;
     /* chat already showed the user what they typed, and with a
      * template the prompt is mostly role markers */
     if (!o->quiet && !o->no_echo && echo) fputs(echo, stdout);
