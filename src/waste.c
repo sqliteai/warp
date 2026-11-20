@@ -1320,6 +1320,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
         media_arm(c);
         read_error_arm(c);
         while (i < n) {
+            const double t1 = nowf();
             int k = (int)(n - i);
             if (k > cmax) k = cmax;
             lg = (k > 1) ? waste_model_prefill(&c->m, prompt + i, k, c->pos)
@@ -1327,6 +1328,9 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
             c->pos += k;
             i += (size_t)k;
             if (!lg) break;
+            if (p.prefill_cb && p.prefill_cb((uint32_t)i, (uint32_t)n,
+                                             (nowf() - t1) * 1000.0, p.prefill_user) != 0)
+                return WASTE_E_CANCELLED;
         }
         media_release(c);
     }

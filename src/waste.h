@@ -375,19 +375,6 @@ void waste_image_clear(waste_ctx *ctx);
 
 /* ---- generation -------------------------------------------------------- */
 
-typedef struct {
-    float temperature;      /* 0 = greedy                                  */
-    float top_p;
-    int   top_k;
-    uint64_t seed;
-    uint32_t max_tokens;
-    const char *grammar;    /* GBNF text for constrained output, or NULL   */
-    const int32_t *stop_tokens;
-    size_t n_stop;
-} waste_gen_params;
-
-void waste_gen_params_init(waste_gen_params *p);
-
 /* Per-token statistics handed to the callback: enough for a host to draw
  * a progress UI and for us to see whether the cache is doing its job. */
 typedef struct {
@@ -404,6 +391,29 @@ typedef struct {
 /* Return 0 to continue, non-zero to stop generation (WASTE_E_CANCELLED). */
 typedef int (*waste_token_cb)(const waste_token_info *info, const char *piece,
                               void *user);
+
+/* Prefill progress: called after each chunk of the prompt is processed.
+ * `tokens_done` is the cumulative number of prompt tokens processed so far;
+ * `tokens_total` is the full prompt length. `ms_total` is the time spent
+ * on the last chunk. A host can use this to show a progress bar while a
+ * long prompt is being evaluated before generation begins. */
+typedef int (*waste_prefill_cb)(uint32_t tokens_done, uint32_t tokens_total,
+                                double ms_total, void *user);
+
+typedef struct {
+    float temperature;      /* 0 = greedy                                  */
+    float top_p;
+    int   top_k;
+    uint64_t seed;
+    uint32_t max_tokens;
+    const char *grammar;    /* GBNF text for constrained output, or NULL   */
+    const int32_t *stop_tokens;
+    size_t n_stop;
+    waste_prefill_cb prefill_cb;  /* called after each prefill chunk       */
+    void *prefill_user;           /* passed through to prefill_cb          */
+} waste_gen_params;
+
+void waste_gen_params_init(waste_gen_params *p);
 
 /* Both of these are bounded by cfg.ctx_tokens: MLA keeps one latent per
  * position and the cache is exactly that long, so the sequence a context

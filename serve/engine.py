@@ -102,7 +102,10 @@ class GenParams(C.Structure):
                 ("max_tokens", C.c_uint32),
                 ("grammar", C.c_char_p),
                 ("stop_tokens", C.POINTER(C.c_int32)),
-                ("n_stop", C.c_size_t)]
+                ("n_stop", C.c_size_t),
+                ("prefill_cb", C.CFUNCTYPE(C.c_int, C.c_uint32, C.c_uint32,
+                                           C.c_double, C.c_void_p)),
+                ("prefill_user", C.c_void_p)]
 
 
 class TokenInfo(C.Structure):
@@ -139,6 +142,12 @@ class Stats(C.Structure):
 
 
 TOKEN_CB = C.CFUNCTYPE(C.c_int, C.POINTER(TokenInfo), C.c_char_p, C.c_void_p)
+
+# Prefill progress callback: called after each chunk of the prompt is
+# processed.  `tokens_done` / `tokens_total` give cumulative progress;
+# `ms_total` is the elapsed time for the last chunk.
+PREFILL_CB = C.CFUNCTYPE(C.c_int, C.c_uint32, C.c_uint32, C.c_double,
+                         C.c_void_p)
 
 # ---- loading -------------------------------------------------------------
 
@@ -678,7 +687,8 @@ class Engine:
                  seed: Optional[int] = None,
                  max_tokens: int = 512,
                  grammar: Optional[str] = None,
-                 stop_tokens: Optional[list[int]] = None) -> bool:
+                 stop_tokens: Optional[list[int]] = None,
+                 prefill_cb: Optional[Callable[[int, int, float], int]] = None) -> bool:
         """Run one generation. Returns False if the callback stopped it.
 
         The lock is held throughout: one waste_ctx, one caller. The callback
@@ -716,6 +726,18 @@ class Engine:
             stops = (C.c_int32 * len(stop_tokens))(*stop_tokens)
             params.stop_tokens = stops
             params.n_stop = len(stop_tokens)
+
+        # Wire up the prefill progress callback
+        prefill_trampoline = None
+        if prefill_cb is not None:
+            def _pf_trampoline(done, total, ms, _user):
+                try:
+                    return prefill_cb(done, total, ms)
+                except Exception:
+                    return 0
+            prefill_trampoline = PREFILL_CB(_pf_trampoline)
+            params.prefill_cb = prefill_trampoline
+            params.prefill_user = None
 
         raised: list[BaseException] = []
         stopped = [False]
